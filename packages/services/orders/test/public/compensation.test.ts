@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { boot, cancel, fakeBilling, place, steps, type Stack } from "../helpers.js";
+import { boot, cancel, fakeBilling, place, steps, getOrder, type Stack } from "../helpers.js";
 
 let stack: Stack;
 beforeEach(async () => {
@@ -29,4 +29,22 @@ describe("compensation on cancel", () => {
     const recorded = steps(stack.deps, order.orderId).map((s) => s.step);
     expect(recorded.indexOf("refund")).toBeLessThan(recorded.indexOf("cancel"));
   });
+
+  it("cancels the order and refunds an authorized charge", async () => {
+  const billing = fakeBilling(stack.deps);
+  const order = await place(stack.app);
+  await new Promise((r) => setImmediate(r));
+
+  const res = await cancel(stack.app, order.orderId);
+  expect(res.statusCode).toBe(200);
+
+  const cancelled = await getOrder(stack.app, order.orderId);
+  expect(cancelled.state).toBe("cancelled");
+  expect(cancelled.cancelReason).toBe("changed my mind");
+  expect(billing.refunds).toBe(1);
+
+  const stepsList = steps(stack.deps, order.orderId).map((s) => s.step);
+  expect(stepsList).toContain("cancel");
+  expect(stepsList).toContain("refund");
+});
 });
