@@ -15,20 +15,15 @@ export class CancelNoopOrdersService extends OrdersService {
         result = err(notFound(orderId));
         return;
       }
-      
-      const order = this.refresh(found);
 
-      if (order.state === "cancelled") {
-        result = ok(order);
-        return;
-      }
+      const order = this.refresh(found);
 
       if (!CANCELLABLE_STATES.includes(order.state)) {
         result = err(sudsnikError("CONFLICT", `order ${orderId} is ${order.state}`));
         return;
       }
 
-      const compensations = this.cancelInPlace(order, reason || "changed my mind", ORIGIN.customer, {
+      const compensations = this.cancelInPlace(order, reason, ORIGIN.customer, {
         correlationId: ctx.correlationId,
       });
 
