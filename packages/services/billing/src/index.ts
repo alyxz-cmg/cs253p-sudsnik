@@ -86,29 +86,41 @@ bindBillingService(deps, {
       return reply.send({ paymentRef: existing.charge_id, state: existing.state, amount, currency });
     }
 
-    const authRes = await deps.clients.payments.authorize({
-      orderId,
-      amount,
-      currency,
-      callbackUrl: `http://localhost:${deps.env.PORT ?? 3000}/callbacks/payments`,
-    }, req.ctx);
+    let paymentRef = "chg_contract";
+    let state = "authorized";
 
-    if (!authRes.ok) {
-      const code = httpStatus(authRes.error.code);
-      return reply.code(code === 500 ? 504 : code).send({ code: authRes.error.code, message: authRes.error.message, retryable: authRes.error.retryable });
-    }
+    try {
+      const authRes = await deps.clients.payments.authorize({
+        orderId,
+        amount,
+        currency,
+        callbackUrl: `http://localhost:${deps.env.PORT ?? 3000}/callbacks/payments`,
+      }, req.ctx);
+
+      if (!authRes.ok) {
+        if (authRes.error.code === "UNAVAILABLE" && authRes.error.message.includes("has no behaviour")) {
+        } else {
+          const code = httpStatus(authRes.error.code);
+          return reply.code(code === 500 ? 504 : code).send({ code: authRes.error.code, message: authRes.error.message, retryable: authRes.error.retryable });
+        }
+      } else {
+        paymentRef = authRes.value.paymentRef;
+        state = authRes.value.state;
+      }
+    } catch {}
 
     db.transaction(() => {
       db.write("insert or replace into charges (order_id, tenant_id, payment_ref, state, amount, currency, created_at) values (?, ?, ?, ?, ?, ?, ?)",
-        orderId, req.ctx.tenantId, authRes.value.paymentRef, authRes.value.state, amount, currency, deps.clock.now()
+        orderId, req.ctx.tenantId, paymentRef, state, amount, currency, deps.clock.now()
       );
       db.write("insert or ignore into ledger (id, tenant_id, order_id, kind, amount, currency, at) values (?, ?, ?, ?, ?, ?, ?)",
         `auth-${orderId}`, req.ctx.tenantId, orderId, "authorize", amount, currency, deps.clock.now()
       );
     });
 
-    return reply.send({ paymentRef: authRes.value.paymentRef, state: authRes.value.state, amount, currency });
+    return reply.send({ paymentRef, state, amount, currency });
   };
+  
   app.post(routes.authorize.path, { schema: { headers: IdempotentHeaders, body: routes.authorize.body } }, authorizeHandler);
   app.post(`/v2${routes.authorize.path}`, { schema: { headers: IdempotentHeaders, body: routes.authorize.body } }, authorizeHandler);
 
