@@ -2,6 +2,9 @@ import Fastify from "fastify";
 import { serializerCompiler, validatorCompiler } from "fastify-type-provider-zod";
 import { z } from "zod";
 import { routes } from "@sudsnik/contracts/services/billing";
+import { join } from "path";
+
+export const handlersDir = join(import.meta.dirname, "topics");
 
 export function readEnv() {
   return {
@@ -55,22 +58,26 @@ export async function createApp(env: any = {}) {
     return reply.status(501).send();
   });
 
-  return server;
+  return {
+    server,
+    drain: async () => {}
+    };
 }
 
-let activeServer: any;
+let activeApp: { server: any; drain: () => Promise<void> } | undefined;
 
 export async function start(env: any = {}) {
-  activeServer = await createApp(env);
+  activeApp = await createApp(env);
   const port = env.PORT || 4004;
   
-  await activeServer.listen({ port, host: "0.0.0.0" });
+  await activeApp.server.listen({ port, host: "0.0.0.0" });
   console.log(`Billing service (canary) listening on port ${port}`);
-  return activeServer;
+  return activeApp;
 }
 
 export async function stop() {
-  if (activeServer) {
-    await activeServer.close();
+  if (activeApp) {
+    await activeApp.drain();
+    await activeApp.server.close();
   }
 }
