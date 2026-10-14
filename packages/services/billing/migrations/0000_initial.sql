@@ -36,3 +36,4 @@ CREATE TABLE IF NOT EXISTS washes (
 );
 
 CREATE INDEX IF NOT EXISTS ledger_order_idx ON ledger (order_id);
+CREATE INDEX IF NOT EXISTS charges_order_idx ON charges (order_id);

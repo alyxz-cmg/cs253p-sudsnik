@@ -1,4 +1,5 @@
 import { fileURLToPath } from "node:url";
+import crypto from "node:crypto";
 import { bootService, readEnvWith } from "@sudsnik/infra-boot";
 import { openDb } from "@sudsnik/infra-db";
 import { createBaseApp } from "@sudsnik/infra-http";
@@ -41,7 +42,7 @@ export async function createApp(deps: ServiceDeps) {
     async onOrderReturned(envelope: Envelope) {
       const payload = envelope.payload as { orderId: string };
       db.write("insert or ignore into ledger (id, tenant_id, order_id, kind, amount, currency, at) values (?, ?, ?, ?, ?, ?, ?)",
-        envelope.id, envelope.tenantId, payload.orderId, "return", 0, DEFAULT_CURRENCY, deps.clock.now()
+        crypto.randomUUID(), envelope.tenantId, payload.orderId, "return", 0, DEFAULT_CURRENCY, deps.clock.now()
       );
       return ok(undefined);
     },
@@ -84,12 +85,12 @@ export async function createApp(deps: ServiceDeps) {
     const amount = req.body?.amount ?? 4900;
     const currency = req.body?.currency ?? "USD";
 
-    const existing = db.readOne<{ charge_id: string; state: string }>("select * from charges where order_id = ?", orderId);
+    const existing = db.readOne<{ payment_ref: string; state: string }>("select * from charges where order_id = ?", orderId);
     if (existing) {
-      return reply.send({ paymentRef: existing.charge_id, state: existing.state, amount, currency });
+      return reply.send({ paymentRef: existing.payment_ref, state: existing.state, amount, currency });
     }
 
-    let paymentRef = "chg_contract";
+    let paymentRef = `chg_${crypto.randomUUID()}`;
     let state = "authorized";
 
     try {
@@ -116,8 +117,8 @@ export async function createApp(deps: ServiceDeps) {
       db.write("insert or replace into charges (order_id, tenant_id, payment_ref, state, amount, currency, created_at) values (?, ?, ?, ?, ?, ?, ?)",
         orderId, req.ctx.tenantId, paymentRef, state, amount, currency, deps.clock.now()
       );
-      db.write("insert or ignore into ledger (id, tenant_id, order_id, kind, amount, currency, at) values (?, ?, ?, ?, ?, ?, ?)",
-        `auth-${orderId}`, req.ctx.tenantId, orderId, "authorize", amount, currency, deps.clock.now()
+      db.write("insert into ledger (id, tenant_id, order_id, kind, amount, currency, at) values (?, ?, ?, ?, ?, ?, ?)",
+        crypto.randomUUID(), req.ctx.tenantId, orderId, "authorize", amount, currency, deps.clock.now()
       );
     });
 
@@ -130,7 +131,7 @@ export async function createApp(deps: ServiceDeps) {
     const orderId = req.params?.orderId ?? "ord1";
     let charge = db.readOne<{ payment_ref: string; amount: number; currency: string }>("select * from charges where order_id = ?", orderId);
     if (!charge) {
-      charge = { payment_ref: "chg_contract", amount: 4900, currency: DEFAULT_CURRENCY };
+      charge = { payment_ref: `chg_${crypto.randomUUID()}`, amount: 4900, currency: DEFAULT_CURRENCY };
     }
 
     const wash = db.readOne<{ cycle_units: number }>("select cycle_units from washes where order_id = ?", orderId);
@@ -149,12 +150,14 @@ export async function createApp(deps: ServiceDeps) {
     }
 
     db.transaction(() => {
-      db.write("update charges set state = ? where order_id = ?", "captured", orderId);
+      db.write("insert or replace into charges (order_id, tenant_id, payment_ref, state, amount, currency, created_at) values (?, ?, ?, ?, ?, ?, ?)",
+        orderId, req.ctx.tenantId, charge.payment_ref, "captured", captureAmount, charge.currency, deps.clock.now()
+      );
       db.write("insert into ledger (id, tenant_id, order_id, kind, amount, currency, at) values (?, ?, ?, ?, ?, ?, ?)",
-        `cap-${orderId}`, req.ctx.tenantId, orderId, "capture", captureAmount, charge.currency, deps.clock.now()
+        crypto.randomUUID(), req.ctx.tenantId, orderId, "capture", captureAmount, charge.currency, deps.clock.now()
       );
       outbox.enqueue({
-        id: `evt-cap-${orderId}`,
+        id: `evt-cap-${crypto.randomUUID()}`,
         topic: "charge.captured",
         tenantId: req.ctx.tenantId,
         occurredAt: deps.clock.now(),
@@ -173,7 +176,7 @@ export async function createApp(deps: ServiceDeps) {
     const orderId = req.params?.orderId ?? "ord1";
     let charge = db.readOne<{ payment_ref: string; amount: number; currency: string }>("select * from charges where order_id = ?", orderId);
     if (!charge) {
-      charge = { payment_ref: "chg_contract", amount: 4900, currency: DEFAULT_CURRENCY };
+      charge = { payment_ref: `chg_${crypto.randomUUID()}`, amount: 4900, currency: DEFAULT_CURRENCY };
     }
 
     try {
@@ -189,10 +192,10 @@ export async function createApp(deps: ServiceDeps) {
     db.transaction(() => {
       db.write("update charges set state = ? where order_id = ?", "refunded", orderId);
       db.write("insert into ledger (id, tenant_id, order_id, kind, amount, currency, at) values (?, ?, ?, ?, ?, ?, ?)",
-        `ref-${orderId}`, req.ctx.tenantId, orderId, "refund", charge.amount, charge.currency, deps.clock.now()
+        crypto.randomUUID(), req.ctx.tenantId, orderId, "refund", charge.amount, charge.currency, deps.clock.now()
       );
       outbox.enqueue({
-        id: `evt-ref-${orderId}`,
+        id: `evt-ref-${crypto.randomUUID()}`,
         topic: "refund.issued",
         tenantId: req.ctx.tenantId,
         occurredAt: deps.clock.now(),
