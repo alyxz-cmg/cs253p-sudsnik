@@ -6,6 +6,7 @@ import { createOutbox, registerHandlers } from "@sudsnik/infra-queue";
 import { BillingEnvSchema } from "@sudsnik/contracts/services/billing";
 import { routes } from "@sudsnik/contracts/services/billing";
 import type { ServiceDeps } from "@sudsnik/contracts";
+import type { FastifyRequest, FastifyReply } from "fastify";
 import { ok } from "@sudsnik/kernel";
 import { z } from "zod";
 import { bindBillingService } from "./core/serviceSink.js";
@@ -52,30 +53,41 @@ export async function createApp(deps: ServiceDeps) {
     app.sudsnik.registerStop(h.stop);
   }
 
-  app.get(routes.quote.path, async (req, reply) => {
-    const { orderId } = req.params as { orderId: string };
-    return reply.send({ orderId, amount: 4900, currency: "USD" });
-  });
+  const quoteHandler = async (req: FastifyRequest<{ Params: { orderId: string } }>, reply: FastifyReply) => {
+    return reply.send({ orderId: req.params.orderId, amount: 4900, currency: "USD" });
+  };
+  app.get(routes.quote.path, quoteHandler);
+  app.get(`/v2${routes.quote.path}`, quoteHandler);
 
-  app.post(routes.authorize.path, { schema: { headers: IdempotentHeaders, body: routes.authorize.body } }, async (req, reply) => {
+  const authorizeHandler = async (req: FastifyRequest, reply: FastifyReply) => {
     return reply.send({ chargeId: "chg_1", state: "authorized", amount: 4900, currency: "USD" });
-  });
+  };
+  app.post(routes.authorize.path, { schema: { headers: IdempotentHeaders, body: routes.authorize.body } }, authorizeHandler);
+  app.post(`/v2${routes.authorize.path}`, { schema: { headers: IdempotentHeaders, body: routes.authorize.body } }, authorizeHandler);
 
-  app.post(routes.capture.path, { schema: { headers: IdempotentHeaders } }, async (req, reply) => {
+  const captureHandler = async (req: FastifyRequest, reply: FastifyReply) => {
     return reply.send({ chargeId: "chg_1", state: "captured", amount: 4900, currency: "USD" });
-  });
+  };
+  app.post(routes.capture.path, { schema: { headers: IdempotentHeaders } }, captureHandler);
+  app.post(`/v2${routes.capture.path}`, { schema: { headers: IdempotentHeaders } }, captureHandler);
 
-  app.post(routes.refund.path, { schema: { headers: IdempotentHeaders } }, async (req, reply) => {
+  const refundHandler = async (req: FastifyRequest, reply: FastifyReply) => {
     return reply.send({ refundId: "ref_1", amount: 4900, currency: "USD" });
-  });
+  };
+  app.post(routes.refund.path, { schema: { headers: IdempotentHeaders } }, refundHandler);
+  app.post(`/v2${routes.refund.path}`, { schema: { headers: IdempotentHeaders } }, refundHandler);
 
-  app.get(routes.ledger.path, async (req, reply) => {
+  const ledgerHandler = async (req: FastifyRequest, reply: FastifyReply) => {
     return reply.send([]);
-  });
+  };
+  app.get(routes.ledger.path, ledgerHandler);
+  app.get(`/v2${routes.ledger.path}`, ledgerHandler);
 
-  app.post(routes.paymentsWebhook.path, { schema: { body: routes.paymentsWebhook.body } }, async (req, reply) => {
-    return reply.code(200).send({ ok: true });
-  });
+  const webhookHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+    return reply.code(200).send({ accepted: true, duplicate: false });
+  };
+  app.post(routes.paymentsWebhook.path, { schema: { body: routes.paymentsWebhook.body } }, webhookHandler);
+  app.post(`/v2${routes.paymentsWebhook.path}`, { schema: { body: routes.paymentsWebhook.body } }, webhookHandler);
 
   app.sudsnik.setReady(true);
   return app;
