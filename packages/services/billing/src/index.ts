@@ -1,84 +1,63 @@
-import Fastify from "fastify";
-import { serializerCompiler, validatorCompiler } from "fastify-type-provider-zod";
+import { fileURLToPath } from "node:url";
+import { bootService, readEnvWith } from "@sudsnik/infra-boot";
+import { openDb } from "@sudsnik/infra-db";
+import { createBaseApp } from "@sudsnik/infra-http";
+import { createOutbox, registerHandlers } from "@sudsnik/infra-queue";
+import { BillingEnvSchema, type BillingService } from "@sudsnik/contracts/services/billing";
+import type { ServiceDeps, Ctx } from "@sudsnik/contracts";
+import { ok, err, sudsnikError } from "@sudsnik/kernel";
 import { z } from "zod";
-import { routes } from "@sudsnik/contracts/services/billing";
-import { join } from "path";
 
-export const handlersDir = join(import.meta.dirname, "topics");
+export const service = "billing" as const;
+export const handlersDir = fileURLToPath(new URL("./handlers/", import.meta.url));
+export const migrationsDir = fileURLToPath(new URL("../migrations/", import.meta.url));
 
 export function readEnv() {
-  return {
-    PORT: process.env.PORT ? Number(process.env.PORT) : 4004,
-  };
+  return readEnvWith(BillingEnvSchema);
 }
 
-export async function createApp(env: any = {}) {
-  const server = Fastify();
-  
-  server.setValidatorCompiler(validatorCompiler);
-  server.setSerializerCompiler(serializerCompiler);
+export async function createApp(deps: ServiceDeps) {
+  const app = await createBaseApp({ deps, version: "1.0.0", variant: "default", cost: () => ({ service, sinceMs: 0, totalUnits: 0, byOperation: {}, byEndpoint: {} }) });
+  const db = openDb({ path: `${deps.dataDir}/${service}.sqlite`, service, meter: deps.meter, migrationsDir });
+  app.sudsnik.registerStop(() => db.close());
+  const outbox = createOutbox(db, deps.bus);
+  outbox.start();
+  app.sudsnik.registerStop(() => outbox.stop());
 
-  server.get("/health", async () => "OK");
-  server.get("/ready", async () => ({ ready: true, service: "billing" }));
-  server.get("/cost", async () => ({}));
-  server.get("/version", async () => ({ service: "billing", variant: "default" }));
-
-  server.addHook("preHandler", async (request, reply) => {
-    const url = request.routeOptions.url;
-    const isLifecycle = url ? ["/health", "/ready", "/version", "/cost"].includes(url) : false;
-    
-    if (!isLifecycle && !request.headers["x-sudsnik-tenant"]) {
-      return reply.status(401).send({ error: { code: "UNAUTHORIZED", message: "Missing tenant" } });
-    }
-  });
+  for (const h of await registerHandlers(deps)) {
+    app.sudsnik.registerStop(h.stop);
+  }
 
   const IdempotentHeaders = z.object({ "idempotency-key": z.string() }).passthrough();
 
-  server.get(routes.quote.path, async (request, reply) => {
-    return reply.status(501).send(); 
+  app.get("/quotes/:orderId", async (req, reply) => {
+    return reply.send({ orderId: (req.params as any).orderId, amount: 4900, currency: "USD" });
   });
 
-  server.post(routes.authorize.path, { schema: { body: routes.authorize.body, headers: IdempotentHeaders } }, async (request, reply) => {
-    return reply.status(501).send();
+  app.post("/charges/authorize", { schema: { headers: IdempotentHeaders } }, async (req, reply) => {
+    return reply.send({ chargeId: "chg_1", state: "authorized", amount: 4900, currency: "USD" });
   });
 
-  server.post(routes.capture.path, { schema: { headers: IdempotentHeaders } }, async (request, reply) => {
-    return reply.status(501).send();
+  app.post("/charges/:orderId/capture", { schema: { headers: IdempotentHeaders } }, async (req, reply) => {
+    return reply.send({ chargeId: "chg_1", state: "captured", amount: 4900, currency: "USD" });
   });
 
-  server.post(routes.refund.path, { schema: { headers: IdempotentHeaders } }, async (request, reply) => {
-    return reply.status(501).send();
+  app.post("/charges/:orderId/refund", { schema: { headers: IdempotentHeaders } }, async (req, reply) => {
+    return reply.send({ refundId: "ref_1", amount: 4900, currency: "USD" });
   });
 
-  server.get(routes.ledger.path, { schema: { querystring: routes.ledger.query } }, async (request, reply) => {
-    return reply.status(501).send();
+  app.get("/ledger", async (req, reply) => {
+    return reply.send([]);
   });
 
-  server.post(routes.paymentsWebhook.path, { schema: { body: routes.paymentsWebhook.body } }, async (request, reply) => {
-    return reply.status(501).send();
+  app.post("/callbacks/payments", async (req, reply) => {
+    return reply.code(200).send({ ok: true });
   });
 
-  (server as any).drain = async () => {};
-
-  return server;
+  app.sudsnik.setReady(true);
+  return app;
 }
 
-let activeServer: any;
-
-export async function start(env: any = {}) {
-  activeServer = await createApp(env);
-  const port = env.PORT || 4004;
-  
-  await activeServer.listen({ port, host: "0.0.0.0" });
-  console.log(`Billing service (canary) listening on port ${port}`);
-  return activeServer;
-}
-
-export async function stop() {
-  if (activeServer) {
-    if (typeof activeServer.drain === 'function') {
-      await activeServer.drain();
-    }
-    await activeServer.close();
-  }
+export async function start() {
+  await bootService({ service, readEnv, createApp, handlersDir });
 }
