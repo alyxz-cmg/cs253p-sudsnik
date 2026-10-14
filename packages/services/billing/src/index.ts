@@ -58,26 +58,27 @@ export async function createApp(env: any = {}) {
     return reply.status(501).send();
   });
 
-  return {
-    server,
-    drain: async () => {}
-    };
+  (server as any).drain = async () => {};
+
+  return server;
 }
 
-let activeApp: { server: any; drain: () => Promise<void> } | undefined;
+let activeServer: any;
 
 export async function start(env: any = {}) {
-  activeApp = await createApp(env);
+  activeServer = await createApp(env);
   const port = env.PORT || 4004;
   
-  await activeApp.server.listen({ port, host: "0.0.0.0" });
+  await activeServer.listen({ port, host: "0.0.0.0" });
   console.log(`Billing service (canary) listening on port ${port}`);
-  return activeApp;
+  return activeServer;
 }
 
 export async function stop() {
-  if (activeApp) {
-    await activeApp.drain();
-    await activeApp.server.close();
+  if (activeServer) {
+    if (typeof activeServer.drain === 'function') {
+      await activeServer.drain();
+    }
+    await activeServer.close();
   }
 }
