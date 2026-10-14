@@ -4,7 +4,9 @@ import { z } from "zod";
 import { routes } from "@sudsnik/contracts/services/billing";
 
 export function readEnv() {
-  return {};
+  return {
+    PORT: process.env.PORT ? Number(process.env.PORT) : 4004,
+  };
 }
 
 export async function createApp(env: any = {}) {
@@ -60,7 +62,8 @@ let activeServer: any;
 
 export async function start(env: any = {}) {
   activeServer = await createApp(env);
-  const port = process.env.PORT ? Number(process.env.PORT) : 4004;
+  const port = env.PORT || 4004;
+  
   await activeServer.listen({ port, host: "0.0.0.0" });
   console.log(`Billing service (canary) listening on port ${port}`);
   return activeServer;
