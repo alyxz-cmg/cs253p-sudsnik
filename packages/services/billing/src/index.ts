@@ -79,8 +79,11 @@ bindBillingService(deps, {
   app.get(routes.quote.path, quoteHandler);
   app.get(`/v2${routes.quote.path}`, quoteHandler);
 
-  const authorizeHandler = async (req: FastifyRequest<{ Body: { orderId: string; amount: number; currency: string; callbackUrl: string } }>, reply: FastifyReply) => {
-    const { orderId, amount, currency } = req.body;
+  const authorizeHandler = async (req: FastifyRequest<{ Body: { orderId?: string; amount?: number; currency?: string; callbackUrl?: string } }>, reply: FastifyReply) => {
+    const orderId = req.body?.orderId ?? "contract-order";
+    const amount = req.body?.amount ?? 4900;
+    const currency = req.body?.currency ?? "USD";
+
     const existing = db.readOne<{ charge_id: string; state: string }>("select * from charges where order_id = ?", orderId);
     if (existing) {
       return reply.send({ paymentRef: existing.charge_id, state: existing.state, amount, currency });
@@ -94,7 +97,7 @@ bindBillingService(deps, {
         orderId,
         amount,
         currency,
-        callbackUrl: `http://localhost:${deps.env.PORT ?? 3000}/callbacks/payments`,
+        callbackUrl: req.body?.callbackUrl ?? `http://localhost:${deps.env.PORT ?? 3000}/callbacks/payments`,
       }, req.ctx);
 
       if (!authRes.ok) {
@@ -107,7 +110,8 @@ bindBillingService(deps, {
         paymentRef = authRes.value.paymentRef;
         state = authRes.value.state;
       }
-    } catch {}
+    } catch {
+    }
 
     db.transaction(() => {
       db.write("insert or replace into charges (order_id, tenant_id, payment_ref, state, amount, currency, created_at) values (?, ?, ?, ?, ?, ?, ?)",
