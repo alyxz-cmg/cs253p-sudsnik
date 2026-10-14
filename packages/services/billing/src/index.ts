@@ -7,6 +7,7 @@ import { BillingEnvSchema, type BillingService } from "@sudsnik/contracts/servic
 import type { ServiceDeps, Ctx } from "@sudsnik/contracts";
 import { ok, err, sudsnikError } from "@sudsnik/kernel";
 import { z } from "zod";
+import { bindBillingService } from "./core/serviceSink.js";
 
 export const service = "billing" as const;
 export const handlersDir = fileURLToPath(new URL("./handlers/", import.meta.url));
@@ -23,6 +24,12 @@ export async function createApp(deps: ServiceDeps) {
   const outbox = createOutbox(db, deps.bus);
   outbox.start();
   app.sudsnik.registerStop(() => outbox.stop());
+
+  bindBillingService(deps, {
+  async onOrderReturned() { return ok(undefined); },
+  async onWashCompleted() { return ok(undefined); },
+  async onOperatorUpdated() { return ok(undefined); },
+  });
 
   for (const h of await registerHandlers(deps)) {
     app.sudsnik.registerStop(h.stop);

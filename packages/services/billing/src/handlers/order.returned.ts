@@ -2,7 +2,7 @@ import type { Envelope, Handler, ServiceDeps } from "@sudsnik/contracts";
 import { err, sudsnikError, type Result } from "@sudsnik/kernel";
 import { billingServiceFor } from "../core/serviceSink.js";
 
-export default class OrderReturnedHandler implements Handler<"order.returned"> {
+class OrderReturnedHandler implements Handler<"order.returned"> {
   readonly topic = "order.returned" as const;
   async handle(envelope: Envelope<"order.returned">, deps: ServiceDeps): Promise<Result<void>> {
     const svc = billingServiceFor(deps);
@@ -10,3 +10,5 @@ export default class OrderReturnedHandler implements Handler<"order.returned"> {
     return svc.onOrderReturned(envelope);
   }
 }
+
+export default new OrderReturnedHandler();
