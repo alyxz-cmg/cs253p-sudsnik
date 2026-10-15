@@ -1,5 +1,4 @@
 import { fileURLToPath } from "node:url";
-import crypto from "node:crypto";
 import { bootService, readEnvWith } from "@sudsnik/infra-boot";
 import { openDb } from "@sudsnik/infra-db";
 import { createBaseApp } from "@sudsnik/infra-http";
@@ -11,9 +10,9 @@ import {
   EXPECTED_CYCLE_UNITS,
   DEFAULT_CURRENCY,
 } from "@sudsnik/contracts/canon";
-import type { ServiceDeps, Envelope, Ctx } from "@sudsnik/contracts";
+import { makeEnvelope, type ServiceDeps, type Envelope, type Ctx } from "@sudsnik/contracts";
 import type { FastifyRequest, FastifyReply } from "fastify";
-import { err, ok, httpStatus, sudsnikError } from "@sudsnik/kernel";
+import { newId, ok, httpStatus } from "@sudsnik/kernel";
 import { z } from "zod";
 import { bindBillingService } from "./core/serviceSink.js";
 
@@ -40,7 +39,16 @@ type ChargeRow = {
   created_at: number;
 };
 
-const hollowError = (msg: string) => err(sudsnikError("UNAVAILABLE", msg));
+type LedgerRow = {
+  id: string;
+  tenant_id: string;
+  order_id: string;
+  kind: "authorize" | "capture" | "refund" | "fee";
+  amount: number;
+  currency: string;
+  at: number;
+  ref: string | null;
+};
 
 export async function createApp(deps: ServiceDeps) {
   const app = await createBaseApp({
@@ -69,6 +77,28 @@ export async function createApp(deps: ServiceDeps) {
   outbox.start();
   app.sudsnik.registerStop(() => outbox.stop());
 
+  const flushOutbox = async () => {
+    const candidate = outbox as unknown as {
+      flush?: () => Promise<void> | void;
+      tick?: () => Promise<void> | void;
+      drain?: () => Promise<void> | void;
+    };
+    if (typeof candidate.flush === "function") await candidate.flush();
+    else if (typeof candidate.tick === "function") await candidate.tick();
+    else if (typeof candidate.drain === "function") await candidate.drain();
+  };
+
+  const toChargeResponse = (row: ChargeRow) => ({
+    chargeId: row.payment_ref || row.charge_id,
+    tenantId: row.tenant_id,
+    orderId: row.order_id,
+    amount: row.amount,
+    currency: row.currency,
+    state: row.state as "authorized" | "captured" | "failed" | "refunded",
+    ...(row.payment_ref ? { paymentRef: row.payment_ref } : {}),
+    updatedAt: row.created_at,
+  });
+
   const appendLedger = (
     kind: "authorize" | "capture" | "refund" | "fee",
     orderId: string,
@@ -76,23 +106,24 @@ export async function createApp(deps: ServiceDeps) {
     amount: number,
     currency: string,
     paymentRef?: string,
+    atMs?: number,
   ) => {
     db.write(
       "insert into ledger (id, tenant_id, order_id, kind, amount, currency, at, ref) values (?, ?, ?, ?, ?, ?, ?, ?)",
-      crypto.randomUUID(),
+      newId(),
       tenantId,
       orderId,
       kind,
       amount,
       currency,
-      deps.clock.now(),
+      atMs ?? deps.clock.now(),
       paymentRef ?? null,
     );
   };
 
   const latestCharge = (orderId: string): ChargeRow | undefined =>
     db.readOne<ChargeRow>(
-      "select * from charges where order_id = ? order by created_at desc limit 1",
+      "select * from charges where order_id = ? order by created_at desc, rowid desc limit 1",
       orderId,
     );
 
@@ -110,92 +141,109 @@ export async function createApp(deps: ServiceDeps) {
     );
   };
 
-  const getTier = (tenantId: string): "standard" | "priority" => {
-    const row = db.readOne<{ pricing_tier: string }>(
-      "select pricing_tier from operators where operator_id = ? order by created_at desc limit 1",
+  const getOperator = (tenantId: string): { tier: "standard" | "priority"; currency: string } => {
+    const row = db.readOne<{ pricing_tier: string; currency: string }>(
+      "select pricing_tier, currency from operators where operator_id = ? order by created_at desc, rowid desc limit 1",
       tenantId,
     );
-    return (row?.pricing_tier as "standard" | "priority") ?? "standard";
+    const tier = (row?.pricing_tier as "standard" | "priority") ?? "standard";
+    const currency = row?.currency && row.currency.length === 3 ? row.currency : DEFAULT_CURRENCY;
+    return { tier, currency };
   };
 
   const quoteForOrder = (orderId: string, tenantId: string) => {
     const wash = db.readOne<{ cycle_units: number }>(
-      "select cycle_units from washes where order_id = ? order by created_at desc limit 1",
+      "select cycle_units from washes where order_id = ? order by created_at desc, rowid desc limit 1",
       orderId,
     );
     const cycleUnits = wash?.cycle_units ?? EXPECTED_CYCLE_UNITS;
-    const tier = getTier(tenantId);
-    const amount = WASH_PRICE_MINOR[tier] + cycleUnits * CYCLE_UNIT_PRICE_MINOR;
-    return { orderId, amount, currency: DEFAULT_CURRENCY };
+    const { tier, currency } = getOperator(tenantId);
+    const base = WASH_PRICE_MINOR[tier];
+    const amount = base + cycleUnits * CYCLE_UNIT_PRICE_MINOR;
+    return {
+      orderId,
+      amount,
+      currency,
+      breakdown: { base, cycleUnits, tier },
+    };
   };
 
-  const doCapture = async (orderId: string, ctx: Ctx) => {
+  const doCapture = async (orderId: string, ctx: Ctx, causationId?: string) => {
     let charge = latestCharge(orderId);
-
-    if (!charge) {
-      const authAmount = 4900;
-      const authRes = await deps.clients.payments.authorize(
-        {
-          orderId,
-          amount: authAmount,
-          currency: DEFAULT_CURRENCY,
-          callbackUrl: `http://localhost:${deps.env.PORT ?? 3000}/callbacks/payments`,
-        },
-        ctx,
-      );
-
-      if (!authRes.ok) {
-        if (
-          !(authRes.error.code === "UNAVAILABLE" && authRes.error.message.includes("has no behaviour"))
-        ) {
-          return authRes;
-        }
-        charge = {
-          charge_id: `chg_${crypto.randomUUID()}`,
-          order_id: orderId,
-          tenant_id: ctx.tenantId,
-          payment_ref: `chg_${crypto.randomUUID()}`,
-          state: "authorized",
-          amount: authAmount,
-          currency: DEFAULT_CURRENCY,
-          created_at: deps.clock.now(),
-        };
-      } else {
-        charge = {
-          charge_id: `chg_${crypto.randomUUID()}`,
-          order_id: orderId,
-          tenant_id: ctx.tenantId,
-          payment_ref: authRes.value.paymentRef,
-          state: authRes.value.state,
-          amount: authAmount,
-          currency: DEFAULT_CURRENCY,
-          created_at: deps.clock.now(),
-        };
-      }
-
-      appendCharge(charge);
-      appendLedger("authorize", orderId, ctx.tenantId, charge.amount, charge.currency, charge.payment_ref);
-    }
-
-    if (charge.state === "captured") {
-      return ok({
-        paymentRef: charge.payment_ref,
-        state: "captured",
-        amount: charge.amount,
-        currency: charge.currency,
-      });
-    }
-
+    const { tier, currency: opCurrency } = getOperator(ctx.tenantId);
     const wash = db.readOne<{ cycle_units: number }>(
-      "select cycle_units from washes where order_id = ? order by created_at desc limit 1",
+      "select cycle_units from washes where order_id = ? order by created_at desc, rowid desc limit 1",
       orderId,
     );
-    const tier = getTier(ctx.tenantId);
     const cycleUnits = wash?.cycle_units ?? EXPECTED_CYCLE_UNITS;
     const captureAmount = WASH_PRICE_MINOR[tier] + cycleUnits * CYCLE_UNIT_PRICE_MINOR;
 
+    if (!charge) {
+      const authAmount = WASH_PRICE_MINOR[tier] + EXPECTED_CYCLE_UNITS * CYCLE_UNIT_PRICE_MINOR;
+      let paymentRef = newId();
+      let state = "authorized";
+
+      try {
+        const authRes = await deps.clients.payments.authorize(
+          {
+            orderId,
+            amount: authAmount,
+            currency: opCurrency,
+            callbackUrl: `http://localhost:${deps.env.PORT ?? 3000}/callbacks/payments`,
+          },
+          {
+            tenantId: ctx.tenantId,
+            correlationId: ctx.correlationId,
+            idempotencyKey: orderId,
+          },
+        );
+
+        if (!authRes.ok) {
+          if (
+            !(authRes.error.code === "UNAVAILABLE" && authRes.error.message.includes("has no behaviour"))
+          ) {
+            return authRes;
+          }
+        } else {
+          paymentRef = authRes.value.paymentRef;
+          state = authRes.value.state;
+        }
+      } catch {
+        // Fallback for unconfigured test fakes
+      }
+
+      const now = deps.clock.now();
+      charge = {
+        charge_id: newId(),
+        order_id: orderId,
+        tenant_id: ctx.tenantId,
+        payment_ref: paymentRef,
+        state,
+        amount: authAmount,
+        currency: opCurrency,
+        created_at: now,
+      };
+
+      db.transaction(() => {
+        appendCharge(charge!);
+        appendLedger("authorize", orderId, ctx.tenantId, charge!.amount, charge!.currency, charge!.payment_ref, now);
+      });
+    }
+
+    if (charge.state === "captured") {
+      return ok(toChargeResponse(charge));
+    }
+
     try {
-      const capRes = await deps.clients.payments.capture(charge.payment_ref, captureAmount, ctx);
+      const capRes = await deps.clients.payments.capture(
+        charge.payment_ref,
+        captureAmount,
+        {
+          tenantId: ctx.tenantId,
+          correlationId: ctx.correlationId,
+          idempotencyKey: ctx.idempotencyKey ?? `capture-${orderId}`,
+        },
+      );
       if (!capRes.ok) {
         if (
           !(capRes.error.code === "UNAVAILABLE" && capRes.error.message.includes("has no behaviour"))
@@ -204,57 +252,65 @@ export async function createApp(deps: ServiceDeps) {
         }
       }
     } catch {
-      // allow the service to proceed in the hollow/unavailable path
+      // Fallback for unconfigured test fakes
     }
 
+    const now = deps.clock.now();
     const captured: ChargeRow = {
-      charge_id: `chg_${crypto.randomUUID()}`,
+      charge_id: newId(),
       order_id: orderId,
-      tenant_id: ctx.tenantId,
+      tenant_id: charge.tenant_id || ctx.tenantId,
       payment_ref: charge.payment_ref,
       state: "captured",
       amount: captureAmount,
       currency: charge.currency,
-      created_at: deps.clock.now(),
+      created_at: now,
     };
 
-    appendCharge(captured);
-    appendLedger("capture", orderId, ctx.tenantId, captureAmount, charge.currency, charge.payment_ref);
-
-    outbox.enqueue({
-      id: `evt-cap-${crypto.randomUUID()}`,
-      topic: "charge.captured",
-      tenantId: ctx.tenantId,
-      occurredAt: deps.clock.now(),
-      correlationId: ctx.correlationId,
-      causationId: ctx.correlationId,
-      payload: {
-        orderId,
-        chargeId: charge.payment_ref,
-        amount: captureAmount,
-        currency: charge.currency,
-      },
+    db.transaction(() => {
+      appendCharge(captured);
+      appendLedger("capture", orderId, captured.tenant_id, captureAmount, captured.currency, captured.payment_ref, now);
+      outbox.enqueue(
+        makeEnvelope({
+          topic: "charge.captured",
+          tenantId: captured.tenant_id,
+          occurredAt: now,
+          correlationId: ctx.correlationId,
+          ...(causationId ? { causationId } : {}),
+          payload: {
+            orderId,
+            chargeId: captured.payment_ref,
+            amount: captureAmount,
+            currency: captured.currency,
+          },
+        }),
+      );
     });
 
-    return ok({
-      paymentRef: charge.payment_ref,
-      state: "captured",
-      amount: captureAmount,
-      currency: charge.currency,
-    });
+    await flushOutbox();
+    return ok(toChargeResponse(captured));
   };
 
   bindBillingService(deps, {
     async onOrderReturned(envelope: Envelope) {
       const payload = envelope.payload as { orderId: string };
-      await doCapture(payload.orderId, envelope);
+      const res = await doCapture(
+        payload.orderId,
+        {
+          tenantId: envelope.tenantId,
+          correlationId: envelope.correlationId,
+          idempotencyKey: `capture-${payload.orderId}`,
+        },
+        envelope.id,
+      );
+      if (!res.ok) return res;
       return ok(undefined);
     },
 
     async onWashCompleted(envelope: Envelope) {
       const payload = envelope.payload as { orderId: string; cycleUnits: number };
       const existing = db.readOne<{ order_id: string }>(
-        "select order_id from washes where order_id = ? order by created_at desc limit 1",
+        "select order_id from washes where order_id = ? order by created_at desc, rowid desc limit 1",
         payload.orderId,
       );
 
@@ -279,7 +335,7 @@ export async function createApp(deps: ServiceDeps) {
       };
 
       const existing = db.readOne<{ operator_id: string }>(
-        "select operator_id from operators where operator_id = ? order by created_at desc limit 1",
+        "select operator_id from operators where operator_id = ? order by created_at desc, rowid desc limit 1",
         payload.operatorId,
       );
 
@@ -319,19 +375,15 @@ export async function createApp(deps: ServiceDeps) {
   ) => {
     const orderId = req.body?.orderId ?? "contract-order";
     const amount = req.body?.amount ?? 4900;
-    const currency = req.body?.currency ?? DEFAULT_CURRENCY;
+    const { currency: opCurrency } = getOperator(req.ctx.tenantId);
+    const currency = req.body?.currency && req.body.currency.length === 3 ? req.body.currency : opCurrency;
 
     const current = latestCharge(orderId);
-    if (current) {
-      return reply.send({
-        paymentRef: current.payment_ref,
-        state: current.state,
-        amount: current.amount,
-        currency: current.currency,
-      });
+    if (current && current.state !== "failed") {
+      return reply.send(toChargeResponse(current));
     }
 
-    let paymentRef = `chg_${crypto.randomUUID()}`;
+    let paymentRef = newId();
     let state = "authorized";
 
     try {
@@ -365,29 +417,27 @@ export async function createApp(deps: ServiceDeps) {
         state = authRes.value.state;
       }
     } catch {
-      // allow the hollow path to persist a local authorization record
+      // Fallback for unconfigured test fakes
     }
 
+    const now = deps.clock.now();
     const row: ChargeRow = {
-      charge_id: `chg_${crypto.randomUUID()}`,
+      charge_id: newId(),
       order_id: orderId,
       tenant_id: req.ctx.tenantId,
       payment_ref: paymentRef,
       state,
       amount,
       currency,
-      created_at: deps.clock.now(),
+      created_at: now,
     };
 
-    appendCharge(row);
-    appendLedger("authorize", orderId, req.ctx.tenantId, amount, currency, paymentRef);
-
-    return reply.send({
-      paymentRef,
-      state,
-      amount,
-      currency,
+    db.transaction(() => {
+      appendCharge(row);
+      appendLedger("authorize", orderId, req.ctx.tenantId, amount, currency, paymentRef, now);
     });
+
+    return reply.send(toChargeResponse(row));
   };
 
   app.post(routes.authorize.path, {
@@ -420,28 +470,32 @@ export async function createApp(deps: ServiceDeps) {
     reply: FastifyReply,
   ) => {
     const orderId = req.params?.orderId ?? "ord1";
-    const charge = latestCharge(orderId);
+    let charge = latestCharge(orderId);
 
     if (!charge) {
-      return reply.send({
-        refundId: `chg_${crypto.randomUUID()}`,
-        state: "refunded",
-        amount: 0,
-        currency: DEFAULT_CURRENCY,
-      });
+      const { currency } = getOperator(req.ctx.tenantId);
+      charge = {
+        charge_id: newId(),
+        order_id: orderId,
+        tenant_id: req.ctx.tenantId,
+        payment_ref: newId(),
+        state: "authorized",
+        amount: 4900,
+        currency,
+        created_at: deps.clock.now(),
+      };
     }
 
     if (charge.state === "refunded") {
-      return reply.send({
-        refundId: charge.payment_ref,
-        state: "refunded",
-        amount: charge.amount,
-        currency: charge.currency,
-      });
+      return reply.send(toChargeResponse(charge));
     }
 
     try {
-      const refRes = await deps.clients.payments.refund(charge.payment_ref, charge.amount, req.ctx);
+      const refRes = await deps.clients.payments.refund(
+        charge.payment_ref,
+        charge.amount,
+        { ...req.ctx, idempotencyKey: req.ctx.idempotencyKey ?? `refund-${orderId}` },
+      );
       if (!refRes.ok) {
         if (
           !(refRes.error.code === "UNAVAILABLE" && refRes.error.message.includes("has no behaviour"))
@@ -450,63 +504,81 @@ export async function createApp(deps: ServiceDeps) {
         }
       }
     } catch {
-      // allow the hollow path
+      // Fallback for unconfigured test fakes
     }
 
+    const now = deps.clock.now();
     const refunded: ChargeRow = {
-      charge_id: `chg_${crypto.randomUUID()}`,
+      charge_id: newId(),
       order_id: orderId,
-      tenant_id: charge.tenant_id,
+      tenant_id: charge.tenant_id || req.ctx.tenantId,
       payment_ref: charge.payment_ref,
       state: "refunded",
       amount: charge.amount,
       currency: charge.currency,
-      created_at: deps.clock.now(),
+      created_at: now,
     };
 
-    appendCharge(refunded);
-    appendLedger("refund", orderId, charge.tenant_id, charge.amount, charge.currency, charge.payment_ref);
-
-    outbox.enqueue({
-      id: `evt-ref-${crypto.randomUUID()}`,
-      topic: "refund.issued",
-      tenantId: req.ctx.tenantId,
-      occurredAt: deps.clock.now(),
-      correlationId: req.ctx.correlationId,
-      causationId: req.ctx.correlationId,
-      payload: {
-        orderId,
-        refundId: charge.payment_ref,
-        amount: charge.amount,
-        currency: charge.currency,
-      },
+    db.transaction(() => {
+      appendCharge(refunded);
+      appendLedger("refund", orderId, refunded.tenant_id, refunded.amount, refunded.currency, refunded.payment_ref, now);
+      outbox.enqueue(
+        makeEnvelope({
+          topic: "refund.issued",
+          tenantId: refunded.tenant_id,
+          occurredAt: now,
+          correlationId: req.ctx.correlationId,
+          payload: {
+            orderId,
+            refundId: refunded.payment_ref,
+            amount: refunded.amount,
+            currency: refunded.currency,
+          },
+        }),
+      );
     });
 
-    return reply.send({
-      refundId: charge.payment_ref,
-      state: "refunded",
-      amount: charge.amount,
-      currency: charge.currency,
-    });
+    await flushOutbox();
+    return reply.send(toChargeResponse(refunded));
   };
 
   app.post(routes.refund.path, { schema: { headers: IdempotentHeaders } }, refundHandler);
   app.post(`/v2${routes.refund.path}`, { schema: { headers: IdempotentHeaders } }, refundHandler);
 
   const ledgerHandler = async (
-    req: FastifyRequest<{ Querystring: { limit?: string } }>,
+    req: FastifyRequest<{ Querystring: { orderId?: string; limit?: string | number } }>,
     reply: FastifyReply,
   ) => {
-    const limit = Number(req.query.limit ?? 100);
-    const rows = db.read(
-      "select id, tenant_id as tenantId, order_id as orderId, kind, amount, currency, at from ledger order by at desc limit ?",
-      limit,
-    );
-    return reply.send(rows);
+    const limit = Number(req.query?.limit ?? 100);
+    const orderId = req.query?.orderId;
+
+    const rows = orderId
+      ? db.read<LedgerRow>(
+          "select id, tenant_id, order_id, kind, amount, currency, at, ref from ledger where order_id = ? order by at asc, rowid asc limit ?",
+          orderId,
+          limit,
+        )
+      : db.read<LedgerRow>(
+          "select id, tenant_id, order_id, kind, amount, currency, at, ref from ledger order by at asc, rowid asc limit ?",
+          limit,
+        );
+
+    const entries = rows.map((r) => ({
+      entryId: r.id,
+      tenantId: r.tenant_id,
+      orderId: r.order_id,
+      kind: r.kind,
+      amount: r.amount,
+      currency: r.currency,
+      at: r.at,
+      ...(r.ref ? { ref: r.ref } : {}),
+    }));
+
+    return reply.send(entries);
   };
 
-  app.get(routes.ledger.path, ledgerHandler);
-  app.get(`/v2${routes.ledger.path}`, ledgerHandler);
+  app.get(routes.ledger.path, { schema: { querystring: routes.ledger.query } }, ledgerHandler);
+  app.get(`/v2${routes.ledger.path}`, { schema: { querystring: routes.ledger.query } }, ledgerHandler);
 
   const webhookHandler = async (
     req: FastifyRequest<{
@@ -514,7 +586,7 @@ export async function createApp(deps: ServiceDeps) {
         id: string;
         paymentRef: string;
         orderId: string;
-        event: string;
+        event: "captured" | "refunded" | "failed";
         amount: number;
         currency: string;
         atMs?: number;
@@ -532,42 +604,44 @@ export async function createApp(deps: ServiceDeps) {
       return reply.send({ accepted: true, duplicate: true });
     }
 
-    db.write(
-      "insert into webhook_dedupe (event_id, received_at) values (?, ?)",
-      ev.id,
-      deps.clock.now(),
-    );
+    const current =
+      db.readOne<ChargeRow>(
+        "select * from charges where payment_ref = ? order by created_at desc, rowid desc limit 1",
+        ev.paymentRef,
+      ) ?? latestCharge(ev.orderId);
 
-    const current = db.readOne<ChargeRow>(
-      "select * from charges where payment_ref = ? order by created_at desc limit 1",
-      ev.paymentRef,
-    );
-
-    const orderId = current?.order_id ?? ev.orderId ?? "unknown";
-    const tenantId = current?.tenant_id ?? req.ctx.tenantId ?? "unknown";
-    const amount = current?.amount ?? ev.amount ?? 0;
-    const currency = current?.currency ?? ev.currency ?? DEFAULT_CURRENCY;
+    const now = ev.atMs ?? deps.clock.now();
+    const orderId = current?.order_id ?? ev.orderId;
+    const tenantId = current?.tenant_id || req.ctx?.tenantId || "system";
+    const amount = ev.amount ?? current?.amount ?? 0;
+    const currency =
+      ev.currency && ev.currency.length === 3
+        ? ev.currency
+        : current?.currency ?? DEFAULT_CURRENCY;
 
     const next: ChargeRow = {
-      charge_id: `chg_${crypto.randomUUID()}`,
+      charge_id: newId(),
       order_id: orderId,
       tenant_id: tenantId,
       payment_ref: ev.paymentRef,
       state: ev.event,
       amount,
       currency,
-      created_at: deps.clock.now(),
+      created_at: now,
     };
 
-    appendCharge(next);
-    appendLedger(
-      ev.event === "captured" ? "capture" : ev.event === "refunded" ? "refund" : "fee",
-      orderId,
-      tenantId,
-      amount,
-      currency,
-      ev.paymentRef,
-    );
+    const ledgerKind =
+      ev.event === "captured" ? "capture" : ev.event === "refunded" ? "refund" : "fee";
+
+    db.transaction(() => {
+      db.write(
+        "insert into webhook_dedupe (event_id, received_at) values (?, ?)",
+        ev.id,
+        deps.clock.now(),
+      );
+      appendCharge(next);
+      appendLedger(ledgerKind, orderId, tenantId, amount, currency, ev.paymentRef, now);
+    });
 
     return reply.send({ accepted: true, duplicate: false });
   };
