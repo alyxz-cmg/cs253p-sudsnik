@@ -499,7 +499,7 @@ export async function createApp(deps: ServiceDeps) {
     const orderId = req.params?.orderId ?? "ord1";
     let charge = latestCharge(orderId);
 
-    // 1. Ensure authorized charge exists locally first
+    // 1. Ensure initial charge exists locally
     if (!charge) {
       const { currency } = getOperator(req.ctx.tenantId);
       const authNow = deps.clock.now();
@@ -528,7 +528,9 @@ export async function createApp(deps: ServiceDeps) {
     }
 
     let refundAmount = req.body?.amount ?? charge.amount;
-    let refundId = newId();
+
+    // PRESERVE PAYMENT LINEAGE: Default refundId to original charge.payment_ref
+    let refundId = charge.payment_ref;
 
     try {
       const refRes = await deps.clients.payments.refund(
@@ -544,7 +546,6 @@ export async function createApp(deps: ServiceDeps) {
         const isUnconfiguredFake = refRes.error.code === "UNAVAILABLE" && refRes.error.message.includes("has no behaviour");
         const isAuthConflict = refRes.error.code === "CONFLICT";
         
-        // 3. Do not fail operation on CONFLICT or unconfigured fake — continue with local compensation
         if (!isUnconfiguredFake && !isAuthConflict) {
           return reply.code(httpStatus(refRes.error.code)).send(refRes.error);
         }
@@ -573,7 +574,7 @@ export async function createApp(deps: ServiceDeps) {
       return reply.send(toChargeResponse(latestAfterCall));
     }
 
-    // 4 & 5. Append refund charge row, write ledger entry, and emit refund.issued event
+    // 3. Log refund row with preserved payment_ref identity
     const now = deps.clock.now();
     const refunded: ChargeRow = {
       charge_id: newId(),
