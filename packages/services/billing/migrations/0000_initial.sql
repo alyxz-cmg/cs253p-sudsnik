@@ -5,7 +5,8 @@ CREATE TABLE IF NOT EXISTS ledger (
   kind TEXT NOT NULL,
   amount INTEGER NOT NULL,
   currency TEXT NOT NULL,
-  at INTEGER NOT NULL
+  at INTEGER NOT NULL,
+  ref TEXT
 );
 
 CREATE TABLE IF NOT EXISTS charges (
