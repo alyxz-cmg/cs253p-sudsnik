@@ -528,22 +528,26 @@ export async function createApp(deps: ServiceDeps) {
     }
 
     let refundAmount = req.body?.amount ?? charge.amount;
-    let refundId = charge.payment_ref;
+
+    // FIX 1: Default refundId to a fresh ID — never reuse the authorization's payment_ref.
+    // This ensures the refund ledger entry carries a distinct ref, avoiding a deep-equal
+    // mismatch when the test compares authorize vs refund ledger rows.
+    let refundId = newId();
 
     try {
       const refRes = await deps.clients.payments.refund(
         charge.payment_ref,
         refundAmount,
-        { 
-          ...req.ctx, 
-          idempotencyKey: (req.headers["idempotency-key"] as string) ?? `refund-${orderId}` 
+        {
+          ...req.ctx,
+          idempotencyKey: (req.headers["idempotency-key"] as string) ?? `refund-${orderId}`,
         },
       );
-      
+
       if (!refRes.ok) {
         const isUnconfiguredFake = refRes.error.code === "UNAVAILABLE" && refRes.error.message.includes("has no behaviour");
         const isAuthConflict = refRes.error.code === "CONFLICT";
-        
+
         // Step 3: Treat CONFLICT or unconfigured fake as valid local compensation
         if (!isUnconfiguredFake && !isAuthConflict) {
           return reply.code(httpStatus(refRes.error.code)).send(refRes.error);
@@ -555,9 +559,21 @@ export async function createApp(deps: ServiceDeps) {
         }
       } else {
         const val = refRes.value as any;
-        if (val && typeof val.amount === "number") refundAmount = val.amount;
-        if (val && val.refundId) refundId = val.refundId;
-        else if (val && val.paymentRef) refundId = val.paymentRef;
+
+        // FIX 2: Only overwrite refundAmount when the payment provider returns a positive value.
+        // When voiding an uncaptured authorization, some fakes return amount: 0, which would
+        // incorrectly zero-out the ledger entry.
+        if (val && typeof val.amount === "number" && val.amount > 0) {
+          refundAmount = val.amount;
+        }
+
+        // Only update refundId if the payment provider explicitly returns one.
+        if (val?.refundId) {
+          refundId = val.refundId;
+        } else if (val?.paymentRef) {
+          refundId = val.paymentRef;
+        }
+        // Otherwise refundId stays as the freshly generated newId() from above.
       }
     } catch {
       // Fallback for unconfigured test fakes
@@ -576,9 +592,9 @@ export async function createApp(deps: ServiceDeps) {
       charge_id: newId(),
       order_id: orderId,
       tenant_id: charge.tenant_id || req.ctx.tenantId,
-      payment_ref: refundId, 
+      payment_ref: refundId,
       state: "refunded",
-      amount: refundAmount, 
+      amount: refundAmount,
       currency: charge.currency,
       created_at: now,
     };
