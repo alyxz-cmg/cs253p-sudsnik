@@ -9,7 +9,8 @@ CREATE TABLE IF NOT EXISTS ledger (
 );
 
 CREATE TABLE IF NOT EXISTS charges (
-  order_id TEXT PRIMARY KEY,
+  charge_id TEXT PRIMARY KEY,
+  order_id TEXT NOT NULL,
   tenant_id TEXT NOT NULL,
   payment_ref TEXT NOT NULL,
   state TEXT NOT NULL,
@@ -27,12 +28,14 @@ CREATE TABLE IF NOT EXISTS operators (
   operator_id TEXT PRIMARY KEY,
   pricing_tier TEXT NOT NULL,
   region TEXT NOT NULL,
-  currency TEXT NOT NULL
+  currency TEXT NOT NULL,
+  created_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS washes (
   order_id TEXT PRIMARY KEY,
-  cycle_units INTEGER NOT NULL
+  cycle_units INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS ledger_order_idx ON ledger (order_id);
