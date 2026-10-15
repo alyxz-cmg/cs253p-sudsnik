@@ -1,5 +1,6 @@
 CREATE TABLE IF NOT EXISTS ledger (
   id TEXT PRIMARY KEY,
+  entry_id TEXT,
   tenant_id TEXT NOT NULL,
   order_id TEXT NOT NULL,
   kind TEXT NOT NULL,
@@ -26,7 +27,8 @@ CREATE TABLE IF NOT EXISTS webhook_dedupe (
 );
 
 CREATE TABLE IF NOT EXISTS operators (
-  operator_id TEXT PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  operator_id TEXT NOT NULL,
   pricing_tier TEXT NOT NULL,
   region TEXT NOT NULL,
   currency TEXT NOT NULL,
@@ -34,14 +36,18 @@ CREATE TABLE IF NOT EXISTS operators (
 );
 
 CREATE TABLE IF NOT EXISTS washes (
-  order_id TEXT PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_id TEXT NOT NULL,
   cycle_units INTEGER NOT NULL,
   created_at INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS ledger_order_idx ON ledger (order_id);
-CREATE INDEX IF NOT EXISTS charges_order_idx ON charges (order_id);
-CREATE INDEX IF NOT EXISTS webhook_event_idx ON webhook_dedupe (event_id);
-CREATE INDEX IF NOT EXISTS operators_tier_idx ON operators (pricing_tier);
-CREATE INDEX IF NOT EXISTS washes_cycle_idx ON washes (cycle_units);
 CREATE INDEX IF NOT EXISTS ledger_tenant_idx ON ledger (tenant_id);
+CREATE INDEX IF NOT EXISTS ledger_kind_idx ON ledger (kind);
+CREATE INDEX IF NOT EXISTS ledger_at_idx ON ledger (at);
+CREATE INDEX IF NOT EXISTS charges_order_idx ON charges (order_id, created_at);
+CREATE INDEX IF NOT EXISTS charges_payment_ref_idx ON charges (payment_ref, created_at);
+CREATE INDEX IF NOT EXISTS webhook_event_idx ON webhook_dedupe (event_id);
+CREATE INDEX IF NOT EXISTS operators_op_idx ON operators (operator_id, created_at);
+CREATE INDEX IF NOT EXISTS washes_order_idx ON washes (order_id, created_at);
