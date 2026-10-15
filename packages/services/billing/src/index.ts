@@ -599,6 +599,15 @@ export async function createApp(deps: ServiceDeps) {
         ev.paymentRef,
       ) ?? latestCharge(ev.orderId);
 
+    if (current && current.state === ev.event) {
+      db.write(
+        "insert into webhook_dedupe (event_id, received_at) values (?, ?)",
+        ev.id,
+        deps.clock.now(),
+      );
+      return reply.send({ accepted: true, duplicate: true });
+    }
+
     const anyTenant = db.readOne<{ tenant_id: string }>(
       "select tenant_id from charges order by created_at desc, rowid desc limit 1",
     );
