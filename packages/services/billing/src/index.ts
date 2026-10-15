@@ -537,6 +537,10 @@ export async function createApp(deps: ServiceDeps) {
         if (!isUnconfiguredFake && !isAuthConflict) {
           return reply.code(httpStatus(refRes.error.code)).send(refRes.error);
         }
+
+        if (isAuthConflict) {
+          refundAmount = charge.amount;
+        }
       } else {
         const val = refRes.value as any;
         if (val && typeof val.amount === "number") refundAmount = val.amount;
