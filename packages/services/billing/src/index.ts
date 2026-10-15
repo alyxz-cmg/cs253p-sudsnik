@@ -499,7 +499,7 @@ export async function createApp(deps: ServiceDeps) {
     const orderId = req.params?.orderId ?? "ord1";
     let charge = latestCharge(orderId);
 
-    // Step 1: Ensure charge exists; if not, record initial authorization
+    // 1. Ensure authorized charge exists locally first
     if (!charge) {
       const { currency } = getOperator(req.ctx.tenantId);
       const authNow = deps.clock.now();
@@ -522,79 +522,66 @@ export async function createApp(deps: ServiceDeps) {
       });
     }
 
-    // Step 2: Return immediately if charge is already in refunded state
+    // 2. Return cached response if state is already refunded
     if (charge.state === "refunded") {
       return reply.send(toChargeResponse(charge));
     }
 
     let refundAmount = req.body?.amount ?? charge.amount;
-
-    // FIX 1: Default refundId to a fresh ID — never reuse the authorization's payment_ref.
-    // This ensures the refund ledger entry carries a distinct ref, avoiding a deep-equal
-    // mismatch when the test compares authorize vs refund ledger rows.
     let refundId = newId();
 
     try {
       const refRes = await deps.clients.payments.refund(
         charge.payment_ref,
         refundAmount,
-        {
-          ...req.ctx,
-          idempotencyKey: (req.headers["idempotency-key"] as string) ?? `refund-${orderId}`,
+        { 
+          ...req.ctx, 
+          idempotencyKey: (req.headers["idempotency-key"] as string) ?? `refund-${orderId}` 
         },
       );
-
+      
       if (!refRes.ok) {
         const isUnconfiguredFake = refRes.error.code === "UNAVAILABLE" && refRes.error.message.includes("has no behaviour");
         const isAuthConflict = refRes.error.code === "CONFLICT";
-
-        // Step 3: Treat CONFLICT or unconfigured fake as valid local compensation
+        
+        // 3. Do not fail operation on CONFLICT or unconfigured fake — continue with local compensation
         if (!isUnconfiguredFake && !isAuthConflict) {
           return reply.code(httpStatus(refRes.error.code)).send(refRes.error);
         }
 
-        // On CONFLICT (uncaptured authorization void), ensure local refund logs full charge amount
         if (isAuthConflict) {
           refundAmount = charge.amount;
         }
       } else {
         const val = refRes.value as any;
-
-        // FIX 2: Only overwrite refundAmount when the payment provider returns a positive value.
-        // When voiding an uncaptured authorization, some fakes return amount: 0, which would
-        // incorrectly zero-out the ledger entry.
         if (val && typeof val.amount === "number" && val.amount > 0) {
           refundAmount = val.amount;
         }
-
-        // Only update refundId if the payment provider explicitly returns one.
         if (val?.refundId) {
           refundId = val.refundId;
         } else if (val?.paymentRef) {
           refundId = val.paymentRef;
         }
-        // Otherwise refundId stays as the freshly generated newId() from above.
       }
     } catch {
       // Fallback for unconfigured test fakes
     }
 
-    // Double-check state in case webhook delivered concurrently during external payment call
     const latestAfterCall = latestCharge(orderId);
     if (latestAfterCall && latestAfterCall.state === "refunded") {
       await outbox.pump();
       return reply.send(toChargeResponse(latestAfterCall));
     }
 
-    // Step 4 & 5: Append refund charge, write ledger entry, and enqueue refund.issued event
+    // 4 & 5. Append refund charge row, write ledger entry, and emit refund.issued event
     const now = deps.clock.now();
     const refunded: ChargeRow = {
       charge_id: newId(),
       order_id: orderId,
       tenant_id: charge.tenant_id || req.ctx.tenantId,
-      payment_ref: refundId,
+      payment_ref: refundId, 
       state: "refunded",
-      amount: refundAmount,
+      amount: refundAmount, 
       currency: charge.currency,
       created_at: now,
     };
