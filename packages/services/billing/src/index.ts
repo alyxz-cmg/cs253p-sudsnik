@@ -141,9 +141,10 @@ export async function createApp(deps: ServiceDeps) {
   }
 
   const quoteHandler = async (req: FastifyRequest<{ Params: { orderId: string } }>, reply: FastifyReply) => {
+    const wash = db.readOne<{ cycle_units: number }>("select cycle_units from washes where order_id = ?", req.params.orderId);
     const tier = getTier(req.ctx.tenantId);
-    const base = WASH_PRICE_MINOR[tier];
-    const amount = base + EXPECTED_CYCLE_UNITS * CYCLE_UNIT_PRICE_MINOR;
+    const cycleUnits = wash?.cycle_units ?? EXPECTED_CYCLE_UNITS;
+    const amount = WASH_PRICE_MINOR[tier] + cycleUnits * CYCLE_UNIT_PRICE_MINOR;
     return reply.send({ orderId: req.params.orderId, amount, currency: DEFAULT_CURRENCY });
   };
   app.get(routes.quote.path, quoteHandler);
