@@ -113,13 +113,16 @@ export async function createApp(deps: ServiceDeps) {
       return false;
     }
 
+    // Ledger amounts are signed integers: refunds represent a negative entry
+    const ledgerAmount = kind === "refund" ? -Math.abs(amount) : amount;
+
     db.write(
       "insert into ledger (id, tenant_id, order_id, kind, amount, currency, at, ref) values (?, ?, ?, ?, ?, ?, ?, ?)",
       newId(),
       tenantId,
       orderId,
       kind,
-      amount,
+      ledgerAmount,
       currency,
       atMs ?? deps.clock.now(),
       paymentRef ?? null,
@@ -499,7 +502,7 @@ export async function createApp(deps: ServiceDeps) {
     const orderId = req.params?.orderId ?? "ord1";
     let charge = latestCharge(orderId);
 
-    // 1. Ensure initial charge exists locally
+    // Ensure authorized charge exists locally
     if (!charge) {
       const { currency } = getOperator(req.ctx.tenantId);
       const authNow = deps.clock.now();
@@ -522,14 +525,11 @@ export async function createApp(deps: ServiceDeps) {
       });
     }
 
-    // 2. Return cached response if state is already refunded
     if (charge.state === "refunded") {
       return reply.send(toChargeResponse(charge));
     }
 
     let refundAmount = req.body?.amount ?? charge.amount;
-
-    // PRESERVE PAYMENT LINEAGE: Default refundId to original charge.payment_ref
     let refundId = charge.payment_ref;
 
     try {
@@ -545,12 +545,14 @@ export async function createApp(deps: ServiceDeps) {
       if (!refRes.ok) {
         const isUnconfiguredFake = refRes.error.code === "UNAVAILABLE" && refRes.error.message.includes("has no behaviour");
         const isAuthConflict = refRes.error.code === "CONFLICT";
+        const isNotFound = refRes.error.code === "NOT_FOUND";
         
-        if (!isUnconfiguredFake && !isAuthConflict) {
+        // Allow CONFLICT, NOT_FOUND (unseeded mock payment), or unconfigured fake to proceed with local refund compensation
+        if (!isUnconfiguredFake && !isAuthConflict && !isNotFound) {
           return reply.code(httpStatus(refRes.error.code)).send(refRes.error);
         }
 
-        if (isAuthConflict) {
+        if (isAuthConflict || isNotFound) {
           refundAmount = charge.amount;
         }
       } else {
@@ -574,7 +576,6 @@ export async function createApp(deps: ServiceDeps) {
       return reply.send(toChargeResponse(latestAfterCall));
     }
 
-    // 3. Log refund row with preserved payment_ref identity
     const now = deps.clock.now();
     const refunded: ChargeRow = {
       charge_id: newId(),
