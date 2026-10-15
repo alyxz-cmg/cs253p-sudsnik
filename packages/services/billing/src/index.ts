@@ -241,7 +241,11 @@ export async function createApp(deps: ServiceDeps) {
         }
       }
     } catch {
-      // Fallback for unconfigured test fakes
+    }
+
+    const postCaptureCharge = latestCharge(orderId);
+    if (postCaptureCharge?.state === "captured") {
+      return ok(toChargeResponse(postCaptureCharge));
     }
 
     const now = deps.clock.now();
@@ -493,7 +497,11 @@ export async function createApp(deps: ServiceDeps) {
         }
       }
     } catch {
-      // Fallback for unconfigured test fakes
+    }
+
+    const postRefundCharge = latestCharge(orderId);
+    if (postRefundCharge?.state === "refunded") {
+      return reply.send(toChargeResponse(postRefundCharge));
     }
 
     const now = deps.clock.now();
