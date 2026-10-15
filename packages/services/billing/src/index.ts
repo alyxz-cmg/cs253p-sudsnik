@@ -261,23 +261,31 @@ export async function createApp(deps: ServiceDeps) {
     };
 
     db.transaction(() => {
-      appendCharge(captured);
-      appendLedger("capture", orderId, captured.tenant_id, captureAmount, captured.currency, captured.payment_ref, now);
-      outbox.enqueue(
-        makeEnvelope({
-          topic: "charge.captured",
-          tenantId: captured.tenant_id,
-          occurredAt: now,
-          correlationId: ctx.correlationId,
-          ...(causationId ? { causationId } : {}),
-          payload: {
-            orderId,
-            chargeId: captured.payment_ref,
-            amount: captureAmount,
-            currency: captured.currency,
-          },
-        }),
+      const chargeExists = db.readOne(
+        "select 1 from charges where order_id = ? and state = ?",
+        orderId,
+        "captured"
       );
+      
+      if (!chargeExists) {
+        appendCharge(captured);
+        appendLedger("capture", orderId, captured.tenant_id, captureAmount, captured.currency, captured.payment_ref, now);
+        outbox.enqueue(
+          makeEnvelope({
+            topic: "charge.captured",
+            tenantId: captured.tenant_id,
+            occurredAt: now,
+            correlationId: ctx.correlationId,
+            ...(causationId ? { causationId } : {}),
+            payload: {
+              orderId,
+              chargeId: captured.payment_ref,
+              amount: captureAmount,
+              currency: captured.currency,
+            },
+          }),
+        );
+      }
     });
 
     await outbox.pump();
@@ -517,22 +525,30 @@ export async function createApp(deps: ServiceDeps) {
     };
 
     db.transaction(() => {
-      appendCharge(refunded);
-      appendLedger("refund", orderId, refunded.tenant_id, refunded.amount, refunded.currency, refunded.payment_ref, now);
-      outbox.enqueue(
-        makeEnvelope({
-          topic: "refund.issued",
-          tenantId: refunded.tenant_id,
-          occurredAt: now,
-          correlationId: req.ctx.correlationId,
-          payload: {
-            orderId,
-            refundId: refunded.payment_ref,
-            amount: refunded.amount,
-            currency: refunded.currency,
-          },
-        }),
+      const chargeExists = db.readOne(
+        "select 1 from charges where order_id = ? and state = ?",
+        orderId,
+        "refunded"
       );
+
+      if (!chargeExists) {
+        appendCharge(refunded);
+        appendLedger("refund", orderId, refunded.tenant_id, refunded.amount, refunded.currency, refunded.payment_ref, now);
+        outbox.enqueue(
+          makeEnvelope({
+            topic: "refund.issued",
+            tenantId: refunded.tenant_id,
+            occurredAt: now,
+            correlationId: req.ctx.correlationId,
+            payload: {
+              orderId,
+              refundId: refunded.payment_ref,
+              amount: refunded.amount,
+              currency: refunded.currency,
+            },
+          }),
+        );
+      }
     });
 
     await outbox.pump();
@@ -649,39 +665,48 @@ export async function createApp(deps: ServiceDeps) {
         ev.id,
         deps.clock.now(),
       );
-      appendCharge(next);
-      appendLedger(ledgerKind, orderId, tenantId, amount, currency, ev.paymentRef, now);
 
-      if (ev.event === "captured") {
-        outbox.enqueue(
-          makeEnvelope({
-            topic: "charge.captured",
-            tenantId,
-            occurredAt: now,
-            correlationId: req.ctx?.correlationId ?? newId(),
-            payload: {
-              orderId,
-              chargeId: ev.paymentRef,
-              amount,
-              currency,
-            },
-          }),
-        );
-      } else if (ev.event === "refunded") {
-        outbox.enqueue(
-          makeEnvelope({
-            topic: "refund.issued",
-            tenantId,
-            occurredAt: now,
-            correlationId: req.ctx?.correlationId ?? newId(),
-            payload: {
-              orderId,
-              refundId: ev.paymentRef,
-              amount,
-              currency,
-            },
-          }),
-        );
+      const chargeExists = db.readOne(
+        "select 1 from charges where order_id = ? and state = ?",
+        orderId,
+        ev.event
+      );
+
+      if (!chargeExists) {
+        appendCharge(next);
+        appendLedger(ledgerKind, orderId, tenantId, amount, currency, ev.paymentRef, now);
+
+        if (ev.event === "captured") {
+          outbox.enqueue(
+            makeEnvelope({
+              topic: "charge.captured",
+              tenantId,
+              occurredAt: now,
+              correlationId: req.ctx?.correlationId ?? newId(),
+              payload: {
+                orderId,
+                chargeId: ev.paymentRef,
+                amount,
+                currency,
+              },
+            }),
+          );
+        } else if (ev.event === "refunded") {
+          outbox.enqueue(
+            makeEnvelope({
+              topic: "refund.issued",
+              tenantId,
+              occurredAt: now,
+              correlationId: req.ctx?.correlationId ?? newId(),
+              payload: {
+                orderId,
+                refundId: ev.paymentRef,
+                amount,
+                currency,
+              },
+            }),
+          );
+        }
       }
     });
 
