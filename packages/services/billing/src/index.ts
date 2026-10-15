@@ -77,12 +77,6 @@ export async function createApp(deps: ServiceDeps) {
   outbox.start();
   app.sudsnik.registerStop(() => outbox.stop());
 
-  const publishToBusSync = async (env: Envelope) => {
-    if (deps.bus && typeof deps.bus.publish === "function") {
-      await deps.bus.publish(env);
-    }
-  };
-
   const toChargeResponse = (row: ChargeRow) => ({
     chargeId: row.payment_ref || row.charge_id,
     tenantId: row.tenant_id,
@@ -262,30 +256,27 @@ export async function createApp(deps: ServiceDeps) {
       created_at: now,
     };
 
-    let envToPublish: Envelope;
-
     db.transaction(() => {
       appendCharge(captured);
       appendLedger("capture", orderId, captured.tenant_id, captureAmount, captured.currency, captured.payment_ref, now);
-      
-      envToPublish = makeEnvelope({
-        topic: "charge.captured",
-        tenantId: captured.tenant_id,
-        occurredAt: now,
-        correlationId: ctx.correlationId,
-        ...(causationId ? { causationId } : {}),
-        payload: {
-          orderId,
-          chargeId: captured.payment_ref,
-          amount: captureAmount,
-          currency: captured.currency,
-        },
-      });
-      
-      outbox.enqueue(envToPublish);
+      outbox.enqueue(
+        makeEnvelope({
+          topic: "charge.captured",
+          tenantId: captured.tenant_id,
+          occurredAt: now,
+          correlationId: ctx.correlationId,
+          ...(causationId ? { causationId } : {}),
+          payload: {
+            orderId,
+            chargeId: captured.payment_ref,
+            amount: captureAmount,
+            currency: captured.currency,
+          },
+        }),
+      );
     });
 
-    await publishToBusSync(envToPublish!);
+    await outbox.pump();
     return ok(toChargeResponse(captured));
   };
 
@@ -517,29 +508,26 @@ export async function createApp(deps: ServiceDeps) {
       created_at: now,
     };
 
-    let envToPublish: Envelope;
-
     db.transaction(() => {
       appendCharge(refunded);
       appendLedger("refund", orderId, refunded.tenant_id, refunded.amount, refunded.currency, refunded.payment_ref, now);
-      
-      envToPublish = makeEnvelope({
-        topic: "refund.issued",
-        tenantId: refunded.tenant_id,
-        occurredAt: now,
-        correlationId: req.ctx.correlationId,
-        payload: {
-          orderId,
-          refundId: refunded.payment_ref,
-          amount: refunded.amount,
-          currency: refunded.currency,
-        },
-      });
-      
-      outbox.enqueue(envToPublish);
+      outbox.enqueue(
+        makeEnvelope({
+          topic: "refund.issued",
+          tenantId: refunded.tenant_id,
+          occurredAt: now,
+          correlationId: req.ctx.correlationId,
+          payload: {
+            orderId,
+            refundId: refunded.payment_ref,
+            amount: refunded.amount,
+            currency: refunded.currency,
+          },
+        }),
+      );
     });
 
-    await publishToBusSync(envToPublish!);
+    await outbox.pump();
     return reply.send(toChargeResponse(refunded));
   };
 
@@ -611,9 +599,13 @@ export async function createApp(deps: ServiceDeps) {
         ev.paymentRef,
       ) ?? latestCharge(ev.orderId);
 
+    const anyTenant = db.readOne<{ tenant_id: string }>(
+      "select tenant_id from charges order by created_at desc, rowid desc limit 1",
+    );
+
     const now = ev.atMs ?? deps.clock.now();
     const orderId = current?.order_id ?? ev.orderId;
-    const tenantId = current?.tenant_id || req.ctx?.tenantId || "system";
+    const tenantId = current?.tenant_id || req.ctx?.tenantId || anyTenant?.tenant_id || "system";
     const amount = ev.amount ?? current?.amount ?? 0;
     const currency =
       ev.currency && ev.currency.length === 3
@@ -634,43 +626,49 @@ export async function createApp(deps: ServiceDeps) {
     const ledgerKind =
       ev.event === "captured" ? "capture" : ev.event === "refunded" ? "refund" : "fee";
 
-    let envToPublish: Envelope | undefined;
-
     db.transaction(() => {
       db.write(
         "insert into webhook_dedupe (event_id, received_at) values (?, ?)",
         ev.id,
-        now,
+        deps.clock.now(),
       );
       appendCharge(next);
       appendLedger(ledgerKind, orderId, tenantId, amount, currency, ev.paymentRef, now);
 
-      let topic: "charge.captured" | "refund.issued" | "charge.failed" | undefined;
-      if (ev.event === "captured") topic = "charge.captured";
-      else if (ev.event === "refunded") topic = "refund.issued";
-      else if (ev.event === "failed") topic = "charge.failed";
-
-      if (topic) {
-        envToPublish = makeEnvelope({
-          topic,
-          tenantId: tenantId,
-          occurredAt: now,
-          correlationId: req.ctx?.correlationId ?? ev.id,
-          payload: {
-            orderId,
-            ...(topic === "refund.issued" ? { refundId: ev.paymentRef } : { chargeId: ev.paymentRef }),
-            amount,
-            currency,
-          },
-        });
-        outbox.enqueue(envToPublish);
+      if (ev.event === "captured") {
+        outbox.enqueue(
+          makeEnvelope({
+            topic: "charge.captured",
+            tenantId,
+            occurredAt: now,
+            correlationId: req.ctx?.correlationId ?? newId(),
+            payload: {
+              orderId,
+              chargeId: ev.paymentRef,
+              amount,
+              currency,
+            },
+          }),
+        );
+      } else if (ev.event === "refunded") {
+        outbox.enqueue(
+          makeEnvelope({
+            topic: "refund.issued",
+            tenantId,
+            occurredAt: now,
+            correlationId: req.ctx?.correlationId ?? newId(),
+            payload: {
+              orderId,
+              refundId: ev.paymentRef,
+              amount,
+              currency,
+            },
+          }),
+        );
       }
     });
 
-    if (envToPublish) {
-      await publishToBusSync(envToPublish);
-    }
-
+    await outbox.pump();
     return reply.send({ accepted: true, duplicate: false });
   };
 
