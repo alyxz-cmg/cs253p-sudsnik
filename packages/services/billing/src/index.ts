@@ -531,9 +531,10 @@ export async function createApp(deps: ServiceDeps) {
       );
       
       if (!refRes.ok) {
-        if (
-          !(refRes.error.code === "UNAVAILABLE" && refRes.error.message.includes("has no behaviour"))
-        ) {
+        const isUnconfiguredFake = refRes.error.code === "UNAVAILABLE" && refRes.error.message.includes("has no behaviour");
+        const isAuthConflict = refRes.error.code === "CONFLICT";
+        
+        if (!isUnconfiguredFake && !isAuthConflict) {
           return reply.code(httpStatus(refRes.error.code)).send(refRes.error);
         }
       } else {
