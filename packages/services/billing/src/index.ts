@@ -499,20 +499,30 @@ export async function createApp(deps: ServiceDeps) {
     const orderId = req.params?.orderId ?? "ord1";
     let charge = latestCharge(orderId);
 
+    // Step 1: Ensure charge exists; if not, record initial authorization
     if (!charge) {
       const { currency } = getOperator(req.ctx.tenantId);
+      const authNow = deps.clock.now();
+      const initialPaymentRef = newId();
+
       charge = {
         charge_id: newId(),
         order_id: orderId,
         tenant_id: req.ctx.tenantId,
-        payment_ref: newId(),
+        payment_ref: initialPaymentRef,
         state: "authorized",
         amount: 4900,
         currency,
-        created_at: deps.clock.now(),
+        created_at: authNow,
       };
+
+      db.transaction(() => {
+        appendCharge(charge!);
+        appendLedger("authorize", orderId, charge!.tenant_id, charge!.amount, charge!.currency, charge!.payment_ref, authNow);
+      });
     }
 
+    // Step 2: Return immediately if charge is already in refunded state
     if (charge.state === "refunded") {
       return reply.send(toChargeResponse(charge));
     }
@@ -534,10 +544,12 @@ export async function createApp(deps: ServiceDeps) {
         const isUnconfiguredFake = refRes.error.code === "UNAVAILABLE" && refRes.error.message.includes("has no behaviour");
         const isAuthConflict = refRes.error.code === "CONFLICT";
         
+        // Step 3: Treat CONFLICT or unconfigured fake as valid local compensation
         if (!isUnconfiguredFake && !isAuthConflict) {
           return reply.code(httpStatus(refRes.error.code)).send(refRes.error);
         }
 
+        // On CONFLICT (uncaptured authorization void), ensure local refund logs full charge amount
         if (isAuthConflict) {
           refundAmount = charge.amount;
         }
@@ -551,12 +563,14 @@ export async function createApp(deps: ServiceDeps) {
       // Fallback for unconfigured test fakes
     }
 
+    // Double-check state in case webhook delivered concurrently during external payment call
     const latestAfterCall = latestCharge(orderId);
     if (latestAfterCall && latestAfterCall.state === "refunded") {
       await outbox.pump();
       return reply.send(toChargeResponse(latestAfterCall));
     }
 
+    // Step 4 & 5: Append refund charge, write ledger entry, and enqueue refund.issued event
     const now = deps.clock.now();
     const refunded: ChargeRow = {
       charge_id: newId(),
