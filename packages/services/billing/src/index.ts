@@ -6,7 +6,7 @@ import { createBaseApp } from "@sudsnik/infra-http";
 import { createOutbox, registerHandlers } from "@sudsnik/infra-queue";
 import { BillingEnvSchema, routes } from "@sudsnik/contracts/services/billing";
 import { WASH_PRICE_MINOR, CYCLE_UNIT_PRICE_MINOR, EXPECTED_CYCLE_UNITS, DEFAULT_CURRENCY } from "@sudsnik/contracts/canon";
-import type { ServiceDeps, Envelope } from "@sudsnik/contracts";
+import type { ServiceDeps, Envelope, Ctx } from "@sudsnik/contracts";
 import type { FastifyRequest, FastifyReply } from "fastify";
 import { ok, httpStatus } from "@sudsnik/kernel";
 import { z } from "zod";
@@ -38,12 +38,61 @@ export async function createApp(deps: ServiceDeps) {
   outbox.start();
   app.sudsnik.registerStop(() => outbox.stop());
 
+  function getTier(tenantId: string): "standard" | "priority" {
+    const row = db.readOne<{ pricing_tier: string }>("select pricing_tier from operators where operator_id = ?", tenantId);
+    return (row?.pricing_tier as "standard" | "priority") ?? "standard";
+  }
+
+  async function doCapture(orderId: string, ctx: Ctx) {
+    type ChargeRow = { payment_ref: string; state: string; amount: number; currency: string; created_at: number };
+    let charge = db.readOne<ChargeRow>("select * from charges where order_id = ?", orderId);
+    if (!charge) {
+      charge = { payment_ref: `chg_${crypto.randomUUID()}`, state: "authorized", amount: 4900, currency: DEFAULT_CURRENCY, created_at: deps.clock.now() };
+    }
+
+    if (charge.state === "captured") {
+      return ok({ paymentRef: charge.payment_ref, state: "captured", amount: charge.amount, currency: charge.currency });
+    }
+
+    const wash = db.readOne<{ cycle_units: number }>("select cycle_units from washes where order_id = ?", orderId);
+    const tier = getTier(ctx.tenantId);
+    const cycleUnits = wash?.cycle_units ?? EXPECTED_CYCLE_UNITS;
+    const captureAmount = WASH_PRICE_MINOR[tier] + cycleUnits * CYCLE_UNIT_PRICE_MINOR;
+
+    try {
+      const capRes = await deps.clients.payments.capture(charge.payment_ref, captureAmount, ctx);
+      if (!capRes.ok) {
+        if (!(capRes.error.code === "UNAVAILABLE" && capRes.error.message.includes("has no behaviour"))) {
+          return capRes;
+        }
+      }
+    } catch {}
+
+    db.transaction(() => {
+      db.write("insert or replace into charges (order_id, tenant_id, payment_ref, state, amount, currency, created_at) values (?, ?, ?, ?, ?, ?, ?)",
+        orderId, ctx.tenantId, charge.payment_ref, "captured", captureAmount, charge.currency, charge.created_at
+      );
+      db.write("insert into ledger (id, tenant_id, order_id, kind, amount, currency, at) values (?, ?, ?, ?, ?, ?, ?)",
+        crypto.randomUUID(), ctx.tenantId, orderId, "capture", captureAmount, charge.currency, deps.clock.now()
+      );
+      outbox.enqueue({
+        id: `evt-cap-${crypto.randomUUID()}`,
+        topic: "charge.captured",
+        tenantId: ctx.tenantId,
+        occurredAt: deps.clock.now(),
+        correlationId: ctx.correlationId,
+        causationId: ctx.correlationId,
+        payload: { orderId, chargeId: charge.payment_ref, amount: captureAmount, currency: charge.currency },
+      });
+    });
+
+    return ok({ paymentRef: charge.payment_ref, state: "captured", amount: captureAmount, currency: charge.currency });
+  }
+
   bindBillingService(deps, {
     async onOrderReturned(envelope: Envelope) {
       const payload = envelope.payload as { orderId: string };
-      db.write("insert or ignore into ledger (id, tenant_id, order_id, kind, amount, currency, at) values (?, ?, ?, ?, ?, ?, ?)",
-        crypto.randomUUID(), envelope.tenantId, payload.orderId, "return", 0, DEFAULT_CURRENCY, deps.clock.now()
-      );
+      await doCapture(payload.orderId, envelope);
       return ok(undefined);
     },
     async onWashCompleted(envelope: Envelope) {
@@ -64,11 +113,6 @@ export async function createApp(deps: ServiceDeps) {
 
   for (const h of await registerHandlers(deps)) {
     app.sudsnik.registerStop(h.stop);
-  }
-
-  function getTier(tenantId: string): "standard" | "priority" {
-    const row = db.readOne<{ pricing_tier: string }>("select pricing_tier from operators where operator_id = ?", tenantId);
-    return (row?.pricing_tier as "standard" | "priority") ?? "standard";
   }
 
   const quoteHandler = async (req: FastifyRequest<{ Params: { orderId: string } }>, reply: FastifyReply) => {
@@ -99,7 +143,7 @@ export async function createApp(deps: ServiceDeps) {
         amount,
         currency,
         callbackUrl: req.body?.callbackUrl ?? `http://localhost:${deps.env.PORT ?? 3000}/callbacks/payments`,
-      }, req.ctx);
+      }, { ...req.ctx, idempotencyKey: orderId });
 
       if (!authRes.ok) {
         if (!(authRes.error.code === "UNAVAILABLE" && authRes.error.message.includes("has no behaviour"))) {
@@ -110,8 +154,7 @@ export async function createApp(deps: ServiceDeps) {
         paymentRef = authRes.value.paymentRef;
         state = authRes.value.state;
       }
-    } catch {
-    }
+    } catch {}
 
     db.transaction(() => {
       db.write("insert or replace into charges (order_id, tenant_id, payment_ref, state, amount, currency, created_at) values (?, ?, ?, ?, ?, ?, ?)",
@@ -129,54 +172,25 @@ export async function createApp(deps: ServiceDeps) {
 
   const captureHandler = async (req: FastifyRequest<{ Params: { orderId: string } }>, reply: FastifyReply) => {
     const orderId = req.params?.orderId ?? "ord1";
-    let charge = db.readOne<{ payment_ref: string; amount: number; currency: string }>("select * from charges where order_id = ?", orderId);
-    if (!charge) {
-      charge = { payment_ref: `chg_${crypto.randomUUID()}`, amount: 4900, currency: DEFAULT_CURRENCY };
+    const res = await doCapture(orderId, req.ctx);
+    if (!res.ok) {
+      return reply.code(httpStatus(res.error.code)).send(res.error);
     }
-
-    const wash = db.readOne<{ cycle_units: number }>("select cycle_units from washes where order_id = ?", orderId);
-    const tier = getTier(req.ctx.tenantId);
-    const cycleUnits = wash?.cycle_units ?? EXPECTED_CYCLE_UNITS;
-    const captureAmount = WASH_PRICE_MINOR[tier] + cycleUnits * CYCLE_UNIT_PRICE_MINOR;
-
-    try {
-      const capRes = await deps.clients.payments.capture(charge.payment_ref, captureAmount, req.ctx);
-      if (!capRes.ok) {
-        if (!(capRes.error.code === "UNAVAILABLE" && capRes.error.message.includes("has no behaviour"))) {
-          return reply.code(httpStatus(capRes.error.code)).send(capRes.error);
-        }
-      }
-    } catch {
-    }
-
-    db.transaction(() => {
-      db.write("insert or replace into charges (order_id, tenant_id, payment_ref, state, amount, currency, created_at) values (?, ?, ?, ?, ?, ?, ?)",
-        orderId, req.ctx.tenantId, charge.payment_ref, "captured", captureAmount, charge.currency, deps.clock.now()
-      );
-      db.write("insert into ledger (id, tenant_id, order_id, kind, amount, currency, at) values (?, ?, ?, ?, ?, ?, ?)",
-        crypto.randomUUID(), req.ctx.tenantId, orderId, "capture", captureAmount, charge.currency, deps.clock.now()
-      );
-      outbox.enqueue({
-        id: `evt-cap-${crypto.randomUUID()}`,
-        topic: "charge.captured",
-        tenantId: req.ctx.tenantId,
-        occurredAt: deps.clock.now(),
-        correlationId: req.ctx.correlationId,
-        causationId: req.ctx.correlationId,
-        payload: { orderId, chargeId: charge.payment_ref, amount: captureAmount, currency: charge.currency },
-      });
-    });
-
-    return reply.send({ paymentRef: charge.payment_ref, state: "captured", amount: captureAmount, currency: charge.currency });
+    return reply.send(res.value);
   };
   app.post(routes.capture.path, { schema: { headers: IdempotentHeaders } }, captureHandler);
   app.post(`/v2${routes.capture.path}`, { schema: { headers: IdempotentHeaders } }, captureHandler);
 
   const refundHandler = async (req: FastifyRequest<{ Params: { orderId: string } }>, reply: FastifyReply) => {
     const orderId = req.params?.orderId ?? "ord1";
-    let charge = db.readOne<{ payment_ref: string; amount: number; currency: string }>("select * from charges where order_id = ?", orderId);
+    type ChargeRow = { payment_ref: string; state: string; amount: number; currency: string; created_at: number };
+    let charge = db.readOne<ChargeRow>("select * from charges where order_id = ?", orderId);
     if (!charge) {
-      charge = { payment_ref: `chg_${crypto.randomUUID()}`, amount: 4900, currency: DEFAULT_CURRENCY };
+      charge = { payment_ref: `chg_${crypto.randomUUID()}`, state: "captured", amount: 4900, currency: DEFAULT_CURRENCY, created_at: deps.clock.now() };
+    }
+
+    if (charge.state === "refunded") {
+      return reply.send({ refundId: charge.payment_ref, amount: charge.amount, currency: charge.currency });
     }
 
     try {
@@ -186,11 +200,12 @@ export async function createApp(deps: ServiceDeps) {
           return reply.code(httpStatus(refRes.error.code)).send(refRes.error);
         }
       }
-    } catch {
-    }
+    } catch {}
 
     db.transaction(() => {
-      db.write("update charges set state = ? where order_id = ?", "refunded", orderId);
+      db.write("insert or replace into charges (order_id, tenant_id, payment_ref, state, amount, currency, created_at) values (?, ?, ?, ?, ?, ?, ?)",
+        orderId, req.ctx.tenantId, charge.payment_ref, "refunded", charge.amount, charge.currency, charge.created_at
+      );
       db.write("insert into ledger (id, tenant_id, order_id, kind, amount, currency, at) values (?, ?, ?, ?, ?, ?, ?)",
         crypto.randomUUID(), req.ctx.tenantId, orderId, "refund", charge.amount, charge.currency, deps.clock.now()
       );
@@ -227,7 +242,16 @@ export async function createApp(deps: ServiceDeps) {
 
     db.transaction(() => {
       db.write("insert into webhook_dedupe (event_id, received_at) values (?, ?)", ev.id, deps.clock.now());
-      db.write("update charges set state = ? where payment_ref = ?", ev.event, ev.paymentRef);
+      
+      const charge = db.readOne<{ order_id: string; tenant_id: string; amount: number; currency: string; created_at: number }>("select * from charges where payment_ref = ?", ev.paymentRef);
+      if (charge) {
+        db.write("insert or replace into charges (order_id, tenant_id, payment_ref, state, amount, currency, created_at) values (?, ?, ?, ?, ?, ?, ?)",
+          charge.order_id, charge.tenant_id, ev.paymentRef, ev.event, charge.amount, charge.currency, charge.created_at
+        );
+        db.write("insert into ledger (id, tenant_id, order_id, kind, amount, currency, at) values (?, ?, ?, ?, ?, ?, ?)",
+          crypto.randomUUID(), charge.tenant_id, charge.order_id, ev.event, charge.amount, charge.currency, deps.clock.now()
+        );
+      }
     });
 
     return reply.send({ accepted: true, duplicate: false });

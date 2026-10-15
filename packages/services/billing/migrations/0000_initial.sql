@@ -37,3 +37,7 @@ CREATE TABLE IF NOT EXISTS washes (
 
 CREATE INDEX IF NOT EXISTS ledger_order_idx ON ledger (order_id);
 CREATE INDEX IF NOT EXISTS charges_order_idx ON charges (order_id);
+CREATE INDEX IF NOT EXISTS webhook_event_idx ON webhook_dedupe (event_id);
+CREATE INDEX IF NOT EXISTS operators_tier_idx ON operators (pricing_tier);
+CREATE INDEX IF NOT EXISTS washes_cycle_idx ON washes (cycle_units);
+CREATE INDEX IF NOT EXISTS ledger_tenant_idx ON ledger (tenant_id);
