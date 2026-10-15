@@ -46,8 +46,33 @@ export async function createApp(deps: ServiceDeps) {
   async function doCapture(orderId: string, ctx: Ctx) {
     type ChargeRow = { payment_ref: string; state: string; amount: number; currency: string; created_at: number };
     let charge = db.readOne<ChargeRow>("select * from charges where order_id = ?", orderId);
+    
     if (!charge) {
-      charge = { payment_ref: `chg_${crypto.randomUUID()}`, state: "authorized", amount: 4900, currency: DEFAULT_CURRENCY, created_at: deps.clock.now() };
+      const authRes = await deps.clients.payments.authorize({
+        orderId,
+        amount: 4900,
+        currency: DEFAULT_CURRENCY,
+        callbackUrl: `http://localhost:${deps.env.PORT ?? 3000}/callbacks/payments`
+      }, ctx);
+
+      if (!authRes.ok) {
+        if (!(authRes.error.code === "UNAVAILABLE" && authRes.error.message.includes("has no behaviour"))) {
+          return authRes;
+        } else {
+          charge = { payment_ref: `chg_${crypto.randomUUID()}`, state: "authorized", amount: 4900, currency: DEFAULT_CURRENCY, created_at: deps.clock.now() };
+        }
+      } else {
+        charge = { payment_ref: authRes.value.paymentRef, state: authRes.value.state, amount: 4900, currency: DEFAULT_CURRENCY, created_at: deps.clock.now() };
+      }
+
+      db.transaction(() => {
+        db.write("insert or replace into charges (order_id, tenant_id, payment_ref, state, amount, currency, created_at) values (?, ?, ?, ?, ?, ?, ?)",
+          orderId, ctx.tenantId, charge!.payment_ref, charge!.state, charge!.amount, charge!.currency, charge!.created_at
+        );
+        db.write("insert into ledger (id, tenant_id, order_id, kind, amount, currency, at) values (?, ?, ?, ?, ?, ?, ?)",
+          crypto.randomUUID(), ctx.tenantId, orderId, "authorize", charge!.amount, charge!.currency, deps.clock.now()
+        );
+      });
     }
 
     if (charge.state === "captured") {
@@ -70,10 +95,10 @@ export async function createApp(deps: ServiceDeps) {
 
     db.transaction(() => {
       db.write("insert or replace into charges (order_id, tenant_id, payment_ref, state, amount, currency, created_at) values (?, ?, ?, ?, ?, ?, ?)",
-        orderId, ctx.tenantId, charge.payment_ref, "captured", captureAmount, charge.currency, charge.created_at
+        orderId, ctx.tenantId, charge!.payment_ref, "captured", captureAmount, charge!.currency, charge!.created_at
       );
       db.write("insert into ledger (id, tenant_id, order_id, kind, amount, currency, at) values (?, ?, ?, ?, ?, ?, ?)",
-        crypto.randomUUID(), ctx.tenantId, orderId, "capture", captureAmount, charge.currency, deps.clock.now()
+        crypto.randomUUID(), ctx.tenantId, orderId, "capture", captureAmount, charge!.currency, deps.clock.now()
       );
       outbox.enqueue({
         id: `evt-cap-${crypto.randomUUID()}`,
@@ -82,7 +107,7 @@ export async function createApp(deps: ServiceDeps) {
         occurredAt: deps.clock.now(),
         correlationId: ctx.correlationId,
         causationId: ctx.correlationId,
-        payload: { orderId, chargeId: charge.payment_ref, amount: captureAmount, currency: charge.currency },
+        payload: { orderId, chargeId: charge!.payment_ref, amount: captureAmount, currency: charge!.currency },
       });
     });
 
@@ -190,7 +215,7 @@ export async function createApp(deps: ServiceDeps) {
     }
 
     if (charge.state === "refunded") {
-      return reply.send({ refundId: charge.payment_ref, amount: charge.amount, currency: charge.currency });
+      return reply.send({ refundId: charge.payment_ref, state: "refunded", amount: charge.amount, currency: charge.currency });
     }
 
     try {
@@ -204,10 +229,10 @@ export async function createApp(deps: ServiceDeps) {
 
     db.transaction(() => {
       db.write("insert or replace into charges (order_id, tenant_id, payment_ref, state, amount, currency, created_at) values (?, ?, ?, ?, ?, ?, ?)",
-        orderId, req.ctx.tenantId, charge.payment_ref, "refunded", charge.amount, charge.currency, charge.created_at
+        orderId, req.ctx.tenantId, charge!.payment_ref, "refunded", charge!.amount, charge!.currency, charge!.created_at
       );
       db.write("insert into ledger (id, tenant_id, order_id, kind, amount, currency, at) values (?, ?, ?, ?, ?, ?, ?)",
-        crypto.randomUUID(), req.ctx.tenantId, orderId, "refund", charge.amount, charge.currency, deps.clock.now()
+        crypto.randomUUID(), req.ctx.tenantId, orderId, "refund", charge!.amount, charge!.currency, deps.clock.now()
       );
       outbox.enqueue({
         id: `evt-ref-${crypto.randomUUID()}`,
@@ -216,11 +241,11 @@ export async function createApp(deps: ServiceDeps) {
         occurredAt: deps.clock.now(),
         correlationId: req.ctx.correlationId,
         causationId: req.ctx.correlationId,
-        payload: { orderId, refundId: charge.payment_ref, amount: charge.amount, currency: charge.currency },
+        payload: { orderId, refundId: charge!.payment_ref, amount: charge!.amount, currency: charge!.currency },
       });
     });
 
-    return reply.send({ refundId: charge.payment_ref, amount: charge.amount, currency: charge.currency });
+    return reply.send({ refundId: charge.payment_ref, state: "refunded", amount: charge.amount, currency: charge.currency });
   };
   app.post(routes.refund.path, { schema: { headers: IdempotentHeaders } }, refundHandler);
   app.post(`/v2${routes.refund.path}`, { schema: { headers: IdempotentHeaders } }, refundHandler);
@@ -233,7 +258,7 @@ export async function createApp(deps: ServiceDeps) {
   app.get(routes.ledger.path, ledgerHandler);
   app.get(`/v2${routes.ledger.path}`, ledgerHandler);
 
-  const webhookHandler = async (req: FastifyRequest<{ Body: { id: string; paymentRef: string; orderId: string; event: string; amount: number; currency: string; atMs: number } }>, reply: FastifyReply) => {
+  const webhookHandler = async (req: FastifyRequest<{ Body: { id: string; paymentRef: string; orderId: string; event: string; amount: number; currency: string; atMs?: number } }>, reply: FastifyReply) => {
     const ev = req.body;
     const existing = db.readOne<{ event_id: string }>("select event_id from webhook_dedupe where event_id = ?", ev.id);
     if (existing) {
@@ -244,14 +269,19 @@ export async function createApp(deps: ServiceDeps) {
       db.write("insert into webhook_dedupe (event_id, received_at) values (?, ?)", ev.id, deps.clock.now());
       
       const charge = db.readOne<{ order_id: string; tenant_id: string; amount: number; currency: string; created_at: number }>("select * from charges where payment_ref = ?", ev.paymentRef);
-      if (charge) {
-        db.write("insert or replace into charges (order_id, tenant_id, payment_ref, state, amount, currency, created_at) values (?, ?, ?, ?, ?, ?, ?)",
-          charge.order_id, charge.tenant_id, ev.paymentRef, ev.event, charge.amount, charge.currency, charge.created_at
-        );
-        db.write("insert into ledger (id, tenant_id, order_id, kind, amount, currency, at) values (?, ?, ?, ?, ?, ?, ?)",
-          crypto.randomUUID(), charge.tenant_id, charge.order_id, ev.event, charge.amount, charge.currency, deps.clock.now()
-        );
-      }
+      
+      const orderId = charge?.order_id ?? ev.orderId ?? "unknown";
+      const tenantId = charge?.tenant_id ?? req.ctx.tenantId ?? "unknown";
+      const amount = charge?.amount ?? ev.amount ?? 0;
+      const currency = charge?.currency ?? ev.currency ?? DEFAULT_CURRENCY;
+      const createdAt = charge?.created_at ?? deps.clock.now();
+
+      db.write("insert or replace into charges (order_id, tenant_id, payment_ref, state, amount, currency, created_at) values (?, ?, ?, ?, ?, ?, ?)",
+        orderId, tenantId, ev.paymentRef, ev.event, amount, currency, createdAt
+      );
+      db.write("insert into ledger (id, tenant_id, order_id, kind, amount, currency, at) values (?, ?, ?, ?, ?, ?, ?)",
+        crypto.randomUUID(), tenantId, orderId, ev.event, amount, currency, ev.atMs ?? deps.clock.now()
+      );
     });
 
     return reply.send({ accepted: true, duplicate: false });
