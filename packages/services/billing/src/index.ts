@@ -493,7 +493,7 @@ export async function createApp(deps: ServiceDeps) {
   app.post(`/v2${routes.capture.path}`, { schema: { headers: IdempotentHeaders } }, captureHandler);
 
   const refundHandler = async (
-    req: FastifyRequest<{ Params: { orderId: string } }>,
+    req: FastifyRequest<{ Params: { orderId: string }; Body?: { amount?: number; currency?: string } }>,
     reply: FastifyReply,
   ) => {
     const orderId = req.params?.orderId ?? "ord1";
@@ -517,18 +517,30 @@ export async function createApp(deps: ServiceDeps) {
       return reply.send(toChargeResponse(charge));
     }
 
+    let refundAmount = req.body?.amount ?? charge.amount;
+    let refundId = charge.payment_ref;
+
     try {
       const refRes = await deps.clients.payments.refund(
         charge.payment_ref,
-        charge.amount,
-        { ...req.ctx, idempotencyKey: `refund-${orderId}` },
+        refundAmount,
+        { 
+          ...req.ctx, 
+          idempotencyKey: (req.headers["idempotency-key"] as string) ?? `refund-${orderId}` 
+        },
       );
+      
       if (!refRes.ok) {
         if (
           !(refRes.error.code === "UNAVAILABLE" && refRes.error.message.includes("has no behaviour"))
         ) {
           return reply.code(httpStatus(refRes.error.code)).send(refRes.error);
         }
+      } else {
+        const val = refRes.value as any;
+        if (val && typeof val.amount === "number") refundAmount = val.amount;
+        if (val && val.refundId) refundId = val.refundId;
+        else if (val && val.paymentRef) refundId = val.paymentRef;
       }
     } catch {
       // Fallback for unconfigured test fakes
@@ -545,9 +557,9 @@ export async function createApp(deps: ServiceDeps) {
       charge_id: newId(),
       order_id: orderId,
       tenant_id: charge.tenant_id || req.ctx.tenantId,
-      payment_ref: charge.payment_ref,
+      payment_ref: refundId, 
       state: "refunded",
-      amount: charge.amount,
+      amount: refundAmount, 
       currency: charge.currency,
       created_at: now,
     };
