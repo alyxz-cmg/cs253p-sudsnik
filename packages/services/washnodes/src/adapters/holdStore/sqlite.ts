@@ -19,7 +19,18 @@ function reserve(db: Db, input: Input, requestedWasher?: string): Result<StoredH
     const clause = requestedWasher ? " and washer_id = ?" : "";
     const args = requestedWasher ? [input.nodeId, requestedWasher] : [input.nodeId];
     const washer = db.read<Washer>(`select washer_id from washers where node_id = ? and state = 'idle' and maintenance = 0${clause} order by idx limit 1`, ...args)[0];
-    if (!washer) return err(sudsnikError("QUOTA", `no idle washer at node ${input.nodeId}`));
+    if (!washer) {
+      // If another request has reserved the last washer but is still waiting on firmware,
+      // expose contention as CONFLICT. A genuinely full node remains retryable QUOTA.
+      const held = db.read<{ firmware_ref: string }>(
+        "select firmware_ref from holds where node_id = ? and state = 'held'",
+        input.nodeId,
+      );
+      if (held.some((row) => isPendingFirmwareRef(row.firmware_ref))) {
+        return err(sudsnikError("CONFLICT", `washer acquisition is already in progress at node ${input.nodeId}`));
+      }
+      return err(sudsnikError("QUOTA", `no idle washer at node ${input.nodeId}`));
+    }
     const id = newId(), ref = pendingFirmwareRef(id), expiresAt = input.nowMs + input.ttlMs;
     if (db.write("update washers set state = 'held', hold_id = ? where washer_id = ? and state = 'idle' and maintenance = 0", id, washer.washer_id).changes !== 1)
       return err(sudsnikError("QUOTA", `no idle washer at node ${input.nodeId}`));

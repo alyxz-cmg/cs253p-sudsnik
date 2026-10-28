@@ -26,8 +26,8 @@ export function publicHold(hold: StoredHold): Hold {
 }
 
 export function isPastExpiry(hold: Hold, nowMs: number): boolean {
-  // Expiry is strictly past the deadline, not at the exact millisecond of expiresAt.
-  return hold.expiresAt < nowMs;
+  // A hold may not start at its deadline; reject it as soon as expiresAt is reached.
+  return hold.expiresAt <= nowMs;
 }
 
 /** The transition guard every store applies: the caller's version must match and the hold must still be held. */
