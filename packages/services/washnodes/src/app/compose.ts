@@ -15,6 +15,7 @@ import { callbackDedupe, eventDedupe } from "../adapters/db/dedupe.js";
 import { seedFleet } from "../adapters/db/fleet.js";
 import { sqliteNodeRepo } from "../adapters/db/nodeRepo.js";
 import { sqliteReportRepo } from "../adapters/db/reportRepo.js";
+import type { DurableHoldStore } from "../ports/holdStore.js";
 import { outboxPublisher } from "../adapters/outboxPublisher.js";
 import { v1Adapter } from "../adapters/v1.js";
 import { v2Adapter } from "../adapters/v2.js";
@@ -75,7 +76,7 @@ export async function composeApp(deps: ServiceDeps, variant: string, profile: Pr
   seedFleet(db);
   const outbox = createOutbox(db, deps.bus);
   const washers = profile.washers(db, deps);
-  const holds = profile.holds(db, washers);
+  const holds = profile.holds(db, washers) as DurableHoldStore;
   const cycles = profile.cycles(db);
   const nodes = sqliteNodeRepo(db);
   const publish = outboxPublisher(outbox, deps.clock);

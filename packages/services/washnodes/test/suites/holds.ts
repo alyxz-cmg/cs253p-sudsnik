@@ -83,5 +83,23 @@ export function holdsSuite(variants: Variant[]): void {
       expect(await h.events("hold.acquired")).toHaveLength(1);
       await h.close();
     });
+
+    it("does not double-book a washer when two acquisitions overlap the firmware call", async () => {
+      const h = await harness(variant);
+      try {
+        // The fake firmware yields once per request, forcing both calls to overlap the old race window.
+        const [first, second] = await Promise.all([h.acquire("B", "race-1"), h.acquire("B", "race-2")]);
+        expect(first.status).toBe(201);
+        expect(second.status).toBe(201);
+        expect(first.body.washerId).not.toBe(second.body.washerId);
+        expect(first.body.holdId).not.toBe(second.body.holdId);
+        expect(await h.events("hold.acquired")).toHaveLength(2);
+        const status = (await h.status("B")).body;
+        expect(status.washers.find((w) => w.washerId === first.body.washerId)).toMatchObject({ state: "held", holdId: first.body.holdId });
+        expect(status.washers.find((w) => w.washerId === second.body.washerId)).toMatchObject({ state: "held", holdId: second.body.holdId });
+      } finally {
+        await h.close();
+      }
+    });
   });
 }

@@ -1,8 +1,9 @@
 import { HOLD_TTL_MS, type Ctx, type Logger } from "@sudsnik/contracts";
-import type { Hold, HoldStore, NodeStatus, WashnodesService } from "@sudsnik/contracts/services/washnodes";
+import type { Hold, NodeStatus, WashnodesService } from "@sudsnik/contracts/services/washnodes";
 import { err, ok, sudsnikError, type Clock, type Result } from "@sudsnik/kernel";
 import { firmwareRefOf, isPastExpiry } from "../domain/hold.js";
 import { isNodeId, washerView } from "../domain/washer.js";
+import type { DurableHoldStore } from "../ports/holdStore.js";
 import type { CycleRepo } from "../ports/cycleRepo.js";
 import type { FirmwareAdapters } from "../ports/firmware.js";
 import type { NodeRepo } from "../ports/nodeRepo.js";
@@ -13,7 +14,7 @@ export interface ServiceDeps {
   clock: Clock;
   logger: Logger;
   washers: WasherRepo;
-  holds: HoldStore;
+  holds: DurableHoldStore;
   cycles: CycleRepo;
   nodes: NodeRepo;
   firmware: FirmwareAdapters;
@@ -42,21 +43,35 @@ export function createService(d: ServiceDeps): WashnodesUseCases {
 
   async function acquireHold(nodeId: string, orderId: string, ctx: Ctx): Promise<Result<Hold>> {
     if (!isNodeId(nodeId)) return err(sudsnikError("NOT_FOUND", `no node ${nodeId}`));
-    const washer = d.washers.pickIdle(nodeId);
-    if (!washer) return err(sudsnikError("QUOTA", `no idle washer at node ${nodeId}`));
+
+    // Claim a real washer and persist a pending hold before making the slow network call.
+    // The store selects and reserves under BEGIN IMMEDIATE, so concurrent requests cannot share it.
+    const reserved = await d.holds.beginAcquire({ nodeId, orderId, tenantId: ctx.tenantId, nowMs: now(), ttlMs: HOLD_TTL_MS });
+    if (!reserved.ok) return reserved;
+    const hold = reserved.value;
+    const washer = d.washers.get(hold.washerId);
+    if (!washer) {
+      await d.holds.release(hold.holdId, hold.version, "washer disappeared during acquisition", now());
+      return err(sudsnikError("INTERNAL", `hold ${hold.holdId} names unknown washer ${hold.washerId}`));
+    }
     const adapter = d.firmware[washer.firmware];
     const fw = await adapter.hold(washer.washerId, ctx);
-    if (!fw.ok) return fw;
+    if (!fw.ok) {
+      // No firmware hold exists, so release only the local reservation and emit no acquired/released event.
+      await d.holds.release(hold.holdId, hold.version, "firmware refused hold", now());
+      return fw;
+    }
     const nowMs = now();
     const ttlMs = Math.max(0, Math.min(HOLD_TTL_MS, fw.value.expiresAt - nowMs));
-    const stored = await d.holds.acquire({ nodeId, washerId: washer.washerId, orderId, tenantId: ctx.tenantId, nowMs, ttlMs, firmwareRef: fw.value.ref });
+    const expiresAt = nowMs + ttlMs;
+    const stored = await d.holds.finalizeAcquire(hold.holdId, hold.version, fw.value.ref, expiresAt, nowMs);
     if (!stored.ok) {
       await adapter.release(washer.washerId, fw.value.ref, ctx);
       return stored;
     }
-    const hold = stored.value;
-    d.publish.emit("hold.acquired", { tenantId: ctx.tenantId, correlationId: ctx.correlationId }, { holdId: hold.holdId, washerId: hold.washerId, nodeId, orderId, expiresAt: hold.expiresAt });
-    return ok(hold);
+    const finalHold = stored.value;
+    d.publish.emit("hold.acquired", { tenantId: ctx.tenantId, correlationId: ctx.correlationId }, { holdId: finalHold.holdId, washerId: finalHold.washerId, nodeId, orderId, expiresAt: finalHold.expiresAt });
+    return ok(finalHold);
   }
 
   async function releaseHold(holdId: string, reason: string, ctx: Ctx): Promise<Result<Hold>> {
