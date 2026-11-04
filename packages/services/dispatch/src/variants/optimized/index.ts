@@ -9,7 +9,7 @@ import { roundRobinRanker, statusRanker } from "../../holds.js";
 import type { Store } from "../../store.js";
 import type { Strategy } from "../../strategy.js";
 import { cachedWindows, canonWindow } from "../../windows.js";
-import { naiveTrust } from "../naive/trust.js";
+import { naiveTrust } from "../../trust.js";
 
 export const variant = "optimized";
 export const handlersDir = fileURLToPath(new URL("../../handlers/", import.meta.url));
