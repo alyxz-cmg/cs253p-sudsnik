@@ -1,9 +1,9 @@
 import { bootService } from "@sudsnik/infra-boot";
 import { readEnv } from "./env.js";
-import { createApp, handlersDir, variant } from "./variants/naive/index.js";
+import { createApp, handlersDir, variant } from "./variants/optimized/index.js";
 
 export { readEnv, createApp, handlersDir, variant };
-export * from "./variants/naive/index.js";
+export * from "./variants/optimized/index.js";
 export type { DispatchService, RelayIngest } from "./port.js";
 
 export const service = "dispatch" as const;

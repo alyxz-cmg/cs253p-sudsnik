@@ -156,7 +156,7 @@ export function createScheduler(parts: SchedulerParts): Scheduler {
       const r = await planPickup(order, ctx);
       if (r.ok) return;
       const nowMs = deps.clock.now();
-      if (order.attempts >= MAX_ATTEMPTS) {
+      if (!strategy.queueForever && order.attempts >= MAX_ATTEMPTS) {
         log.error("pickup_unschedulable", { orderId: order.order_id, attempts: order.attempts, error: r.error.message });
         await giveUp(order, r.error.message, order.attempts, ctx);
         return;
@@ -179,7 +179,7 @@ export function createScheduler(parts: SchedulerParts): Scheduler {
       return;
     }
     const failures = order.hold_failures + 1;
-    if (failures >= MAX_ATTEMPTS) {
+    if (!strategy.queueForever && failures >= MAX_ATTEMPTS) {
       log.error("hold_unobtainable", { orderId: order.order_id, failures, error: r.error.message });
       await giveUp(order, r.error.message, failures, ctx);
       return;
