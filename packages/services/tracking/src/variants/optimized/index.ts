@@ -103,34 +103,49 @@ function service(parts: Parts) {
   // Cached read: memory first, persistent store second.
   // This function intentionally never calls ephemeris.
   async function positionCached(
-    shuttleId: string,
-    ctx: Ctx,
-  ): Promise<Result<Position>> {
-    const key = keyOf(shuttleId, ctx);
-    const now = deps.clock.now();
+  shuttleId: string,
+  ctx: Ctx,
+): Promise<Result<Position>> {
+  const key = keyOf(shuttleId, ctx);
+  const now = deps.clock.now();
 
-    const hit = cache.get(key);
+  const hit = cache.get(key);
 
-    if (hit && hit.expiresAt > now) {
-      return ok(cached(hit.position));
-    }
+  // A memory-cache hit is valid only while the observation itself
+  // is within the configured TTL.
+  if (
+    hit &&
+    hit.expiresAt > now &&
+    now - hit.position.observedAt <= ttlMs
+  ) {
+    return ok(cached(hit.position));
+  }
 
-    // Memory cache missed or expired: use persistent storage.
-    const stored = store.position(shuttleId);
+  // Memory cache missed or expired: check persistent storage.
+  const stored = store.position(shuttleId);
 
-    if (!stored) {
-      return err(
-        sudsnikError(
-          "NOT_FOUND",
-          `no stored position for shuttle ${shuttleId}`,
-        ),
-      );
-    }
+  if (!stored) {
+    cache.delete(key);
+    return err(
+      sudsnikError(
+        "NOT_FOUND",
+        `no stored position for shuttle ${shuttleId}`,
+      ),
+    );
+  }
 
+  // The memory entry may have expired while the persisted
+  // observation is still fresh.
+  if (now - stored.observedAt <= ttlMs) {
     remember(ctx, stored);
-
     return ok(cached(stored));
   }
+
+  // The persisted observation itself is stale.
+  // Refresh from ephemeris and return source: "fresh".
+  cache.delete(key);
+  return position(shuttleId, ctx);
+}
 
   return {
     position,
