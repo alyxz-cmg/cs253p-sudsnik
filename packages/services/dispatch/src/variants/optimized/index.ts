@@ -34,12 +34,12 @@ export const handlersDir = fileURLToPath(
   new URL("../../handlers/", import.meta.url),
 );
 
-export const STATUS_TTL_MS = 60_000;
+export const STATUS_TTL_MS = 300_000;
 
 /**
  * Optimized dispatch strategy:
  * - Cache habitat windows for one orbit.
- * - Cache node status for the provider's 60-second TTL.
+ * - Cache node status for the provider's 300-second TTL.
  * - Coalesce concurrent status requests.
  * - Use a circuit breaker when ephemeris is unavailable.
  * - Fall back to canon windows and persistent round-robin node selection.

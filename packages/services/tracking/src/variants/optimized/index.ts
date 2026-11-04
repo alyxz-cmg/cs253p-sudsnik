@@ -44,14 +44,25 @@ function service(parts: Parts) {
   }
 
   function remember(
-    ctx: Ctx,
-    position: StoredPosition,
-  ): void {
-    cache.set(keyOf(position.shuttleId, ctx), {
-      position,
-      expiresAt: deps.clock.now() + ttlMs,
-    });
+  ctx: Ctx,
+  position: StoredPosition,
+): void {
+  const key = keyOf(position.shuttleId, ctx);
+  const previous = cache.get(key);
+
+  // Never let an out-of-order callback replace a newer observation.
+  if (
+    previous &&
+    previous.position.observedAt > position.observedAt
+  ) {
+    return;
   }
+
+  cache.set(key, {
+    position,
+    expiresAt: deps.clock.now() + ttlMs,
+  });
+}
 
   // Fresh read: calls ephemeris and persists the observation.
   async function position(
@@ -109,19 +120,8 @@ function service(parts: Parts) {
   const key = keyOf(shuttleId, ctx);
   const now = deps.clock.now();
 
-  const hit = cache.get(key);
-
-  // A memory-cache hit is valid only while the observation itself
-  // is within the configured TTL.
-  if (
-    hit &&
-    hit.expiresAt > now &&
-    now - hit.position.observedAt <= ttlMs
-  ) {
-    return ok(cached(hit.position));
-  }
-
-  // Memory cache missed or expired: check persistent storage.
+  // SQLite is authoritative. Check it before returning an
+  // in-memory entry so a newer callback cannot be hidden.
   const stored = store.position(shuttleId);
 
   if (!stored) {
@@ -134,17 +134,32 @@ function service(parts: Parts) {
     );
   }
 
-  // The memory entry may have expired while the persisted
-  // observation is still fresh.
-  if (now - stored.observedAt <= ttlMs) {
-    remember(ctx, stored);
-    return ok(cached(stored));
+  const hit = cache.get(key);
+
+  // Select the newest observation.
+  const latest =
+    hit && hit.position.observedAt > stored.observedAt
+      ? hit.position
+      : stored;
+
+  // An expired observation must be refreshed from ephemeris.
+  // An expired memory entry alone does not require a provider call.
+  if (now - latest.observedAt > ttlMs) {
+    cache.delete(key);
+    return position(shuttleId, ctx);
   }
 
-  // The persisted observation itself is stale.
-  // Refresh from ephemeris and return source: "fresh".
-  cache.delete(key);
-  return position(shuttleId, ctx);
+  // Rehydrate the memory cache after expiration or when SQLite
+  // contains a newer observation.
+  if (
+    !hit ||
+    hit.expiresAt <= now ||
+    latest.observedAt > hit.position.observedAt
+  ) {
+    remember(ctx, latest);
+  }
+
+  return ok(cached(latest));
 }
 
   return {
