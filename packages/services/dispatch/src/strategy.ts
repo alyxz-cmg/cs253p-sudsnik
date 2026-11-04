@@ -14,7 +14,7 @@ export interface Strategy {
   /** Work the variant insists on before each pickup is planned. */
   beforePickup?(ctx: Ctx): Promise<Result<void>>;
   /** Keep retryable scheduling and hold failures queued indefinitely instead of terminally failing an order. */
-  queueForever?: boolean;
+  queueForever: boolean;
   ingest: IngestTrustFactory;
 }
 

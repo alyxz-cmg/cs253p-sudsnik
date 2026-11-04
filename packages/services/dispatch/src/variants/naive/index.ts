@@ -18,6 +18,7 @@ export const handlersDir = fileURLToPath(new URL("../../handlers/", import.meta.
 export function naiveStrategy(deps: ServiceDeps, store: Store): Strategy {
   const ephemeris = deps.clients.ephemeris;
   return {
+    queueForever: false,
     windows: liveWindows(ephemeris),
     nodes: statusRanker((nodeId, ctx) => ephemeris.status(nodeId, ctx)),
     async beforePickup(ctx) {

@@ -44,6 +44,10 @@ export async function buildApp(deps: ServiceDeps, variant: string, strategy: Str
   const outbox = createOutbox(db, deps.bus);
   const publisher = createPublisher(deps, outbox);
   const chosen = strategy(deps, store);
+  deps.telemetry.logger.info("dispatch_strategy", {
+    variant,
+    queueForever: chosen.queueForever,
+  });
   const scheduler = createScheduler({ deps, db, store, outbox, publisher, gate, strategy: chosen, maxInflight: env.value.SUDSNIK_DISPATCH_MAX_INFLIGHT });
   const ingest = createIngest({ deps, db, store, outbox, publisher, trust: chosen.ingest, onArrived: () => scheduler.pumpArrivals() });
   bindRuntime(deps, { store, outbox, scheduler, ingest, gate });

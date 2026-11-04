@@ -1,56 +1,166 @@
-import { SHUTTLES, type Ctx, type ServiceDeps } from "@sudsnik/contracts";
+
+import {
+  type Ctx,
+  type ServiceDeps,
+} from "@sudsnik/contracts";
 import type { Position } from "@sudsnik/contracts/services/tracking";
-import { ok, type Result } from "@sudsnik/kernel";
-import { buildApp, cached, fresh, ingest, podLocation, type Parts } from "../../app.js";
+import {
+  err,
+  ok,
+  sudsnikError,
+  type Result,
+} from "@sudsnik/kernel";
+import {
+  buildApp,
+  cached,
+  fresh,
+  ingest,
+  podLocation,
+  type Parts,
+} from "../../app.js";
+import type { StoredPosition } from "../../store.js";
 
 export const variant = "optimized";
 
+interface CacheEntry {
+  position: StoredPosition;
+  expiresAt: number;
+}
+
 function service(parts: Parts) {
   const { deps, store, ttlMs } = parts;
-  const pending = new Map<string, Promise<Result<Position>>>();
 
-  async function position(shuttleId: string, ctx: Ctx): Promise<Result<Position>> {
-    const key = ctx.tenantId + ":" + shuttleId;
+  // In-memory cache, backed by the persistent SQLite store.
+  const cache = new Map<string, CacheEntry>();
+
+  // Coalesce concurrent fresh ephemeris requests.
+  const pending = new Map<
+    string,
+    Promise<Result<Position>>
+  >();
+
+  function keyOf(shuttleId: string, ctx: Ctx): string {
+    return `${ctx.tenantId}:${shuttleId}`;
+  }
+
+  function remember(
+    ctx: Ctx,
+    position: StoredPosition,
+  ): void {
+    cache.set(keyOf(position.shuttleId, ctx), {
+      position,
+      expiresAt: deps.clock.now() + ttlMs,
+    });
+  }
+
+  // Fresh read: calls ephemeris and persists the observation.
+  async function position(
+    shuttleId: string,
+    ctx: Ctx,
+  ): Promise<Result<Position>> {
+    const key = keyOf(shuttleId, ctx);
+
     let request = pending.get(key);
+
     if (!request) {
       request = (async () => {
-        const result = await deps.clients.ephemeris.position(shuttleId, ctx);
+        const result = await deps.clients.ephemeris.position(
+          shuttleId,
+          ctx,
+        );
+
         if (!result.ok) return result;
-        store.putPosition({ shuttleId, orbitPhase: result.value.orbitPhase, observedAt: result.value.atMs });
+
+        const observed: StoredPosition = {
+          shuttleId,
+          orbitPhase: result.value.orbitPhase,
+          observedAt: result.value.atMs,
+        };
+
+        store.putPosition(observed);
+
+        // If the provider returned an older observation, retain
+        // the newer position already stored in SQLite.
+        const latest = store.position(shuttleId) ?? observed;
+
+        remember(ctx, latest);
+
         return ok(fresh(result.value));
       })();
+
       pending.set(key, request);
     }
+
     try {
       return await request;
     } finally {
-      if (pending.get(key) === request) pending.delete(key);
+      if (pending.get(key) === request) {
+        pending.delete(key);
+      }
     }
   }
 
-  async function positionCached(shuttleId: string, ctx: Ctx): Promise<Result<Position>> {
-    const known = store.position(shuttleId);
-    if (known && deps.clock.now() - known.observedAt <= ttlMs) return ok(cached(known));
-    return position(shuttleId, ctx);
+  // Cached read: memory first, persistent store second.
+  // This function intentionally never calls ephemeris.
+  async function positionCached(
+    shuttleId: string,
+    ctx: Ctx,
+  ): Promise<Result<Position>> {
+    const key = keyOf(shuttleId, ctx);
+    const now = deps.clock.now();
+
+    const hit = cache.get(key);
+
+    if (hit && hit.expiresAt > now) {
+      return ok(cached(hit.position));
+    }
+
+    // Memory cache missed or expired: use persistent storage.
+    const stored = store.position(shuttleId);
+
+    if (!stored) {
+      return err(
+        sudsnikError(
+          "NOT_FOUND",
+          `no stored position for shuttle ${shuttleId}`,
+        ),
+      );
+    }
+
+    remember(ctx, stored);
+
+    return ok(cached(stored));
   }
 
   return {
     position,
     positionCached,
+
+    // Only return shuttles with a position actually stored.
     async positions(ctx: Ctx): Promise<Result<Position[]>> {
-      const results = await Promise.all(SHUTTLES.map((shuttleId) => position(shuttleId, ctx)));
-      const positions: Position[] = [];
-      for (const result of results) {
-        if (!result.ok) return result;
-        positions.push(result.value);
+      const stored = store.positions();
+
+      for (const position of stored) {
+        remember(ctx, position);
       }
-      return ok(positions);
+
+      return ok(stored.map(cached));
     },
+
     podLocation: podLocation(parts),
-    relay: (body: Parameters<typeof ingest>[1], ctx: Ctx) => ingest(parts, body, ctx),
+
+    // Accepted callbacks update the persistent store and refresh
+    // the in-memory cache. Rejected callbacks do not populate it.
+    relay: (
+      body: Parameters<typeof ingest>[1],
+      ctx: Ctx,
+    ) =>
+      ingest(parts, body, ctx, (position) => {
+        remember(ctx, position);
+      }),
   };
 }
 
 export function createApp(deps: ServiceDeps) {
-  return buildApp(deps, "optimized", service);
+  return buildApp(deps, variant, service);
 }
