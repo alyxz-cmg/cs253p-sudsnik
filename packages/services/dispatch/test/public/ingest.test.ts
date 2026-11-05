@@ -88,4 +88,91 @@ describe("relay ingest", () => {
     expect(res.statusCode).toBe(200);
     expect(deps.bus.published.filter((e) => e.topic !== "pickup.scheduled")).toHaveLength(0);
   });
+
+  it("deduplicates a repeated callback id", async () => {
+  const { deps, orderId, podId, post } = await placed();
+
+  const callback = buildCallback("collected", {
+    orderId,
+    podId,
+    shuttleId: "sh1",
+    atMs: 100,
+  });
+
+  const first = await post(callback);
+  const second = await post(callback);
+
+  expect(first.statusCode).toBe(200);
+  expect(first.json()).toEqual({
+    accepted: true,
+    duplicate: false,
+  });
+
+  expect(second.statusCode).toBe(200);
+  expect(second.json()).toEqual({
+    accepted: true,
+    duplicate: true,
+  });
+
+  expect(deps.bus.ofTopic("pod.collected")).toHaveLength(1);
+});
+
+it("fills earlier journey steps when a later callback arrives first", async () => {
+  const { deps, orderId, podId, post } = await placed();
+
+  const delivered = await post(
+    buildCallback("delivered", {
+      orderId,
+      podId,
+      shuttleId: "sh1",
+      nodeId: "B",
+      atMs: 200,
+    }),
+  );
+
+  const lateCollected = await post(
+    buildCallback("collected", {
+      orderId,
+      podId,
+      shuttleId: "sh1",
+      atMs: 100,
+    }),
+  );
+
+  expect(delivered.statusCode).toBe(200);
+  expect(delivered.json()).toEqual({
+    accepted: true,
+    duplicate: false,
+  });
+
+  expect(lateCollected.statusCode).toBe(200);
+  expect(lateCollected.json()).toEqual({
+    accepted: true,
+    duplicate: true,
+  });
+
+  expect(deps.bus.ofTopic("pod.collected")).toHaveLength(1);
+  expect(deps.bus.ofTopic("pod.delivered")).toHaveLength(1);
+});
+
+it("rejects a callback whose checksum does not verify", async () => {
+  const { orderId, podId, post } = await placed();
+
+  const callback = buildCallback("collected", {
+    orderId,
+    podId,
+    shuttleId: "sh1",
+  });
+
+  const invalid = {
+    ...callback,
+    checksum:
+      callback.checksum === "00000000"
+        ? "11111111"
+        : "00000000",
+  };
+
+  expect((await post(invalid)).statusCode).toBe(400);
+});
+
 });

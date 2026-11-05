@@ -27,7 +27,7 @@ import {
   cachedWindows,
   canonWindow,
 } from "../../windows.js";
-import { naiveTrust } from "../../trust.js";
+import { optimizedTrust } from "./trust.js";
 
 export const variant = "optimized";
 export const handlersDir = fileURLToPath(
@@ -259,7 +259,7 @@ export function optimizedStrategy(
         : result;
     },
 
-    ingest: naiveTrust,
+    ingest: optimizedTrust,
   };
 }
 

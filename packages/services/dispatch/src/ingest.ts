@@ -110,22 +110,74 @@ export function createIngest(parts: IngestParts): Ingest {
 
   function applyPod(body: PodCallback, ctx: Ctx, nowMs: number): Result<{ duplicate: boolean; arrived: boolean }> {
     return db.transaction((): Result<{ duplicate: boolean; arrived: boolean }> => {
-      if (!trust.fresh({ id: body.id, tenantId: ctx.tenantId, kind: body.kind, orderId: body.orderId }, nowMs)) return ok({ duplicate: true, arrived: false });
-      const order = store.order(body.orderId);
-      if (!order) return reject(body, ctx, "NOT_FOUND", `order ${body.orderId} is unknown to dispatch`, nowMs);
-      const steps = trust.range(body, order.progress);
-      if (!steps.ok) return steps;
-      if (steps.value === undefined) return ok({ duplicate: true, arrived: false });
-      const { from, to: target } = steps.value;
-      const delivers = from <= stepIndex("delivered") && target >= stepIndex("delivered");
-      const at = journeyOf(order, body);
-      // Refused before any step runs: a transaction that returns an error still commits, so a step applied
-      // beside a failure would publish its event and leave `progress` behind to publish it again.
-      if (delivers && at.nodeId === undefined) return err(sudsnikError("CONFLICT", `order ${order.order_id} has no node to be delivered to`));
-      for (let i = from; i <= target; i++) applyStep(order, STEPS[i - 1]!, body, ctx, nowMs, at);
-      if (target > order.progress) store.setProgress(order.order_id, target, nowMs);
-      return ok({ duplicate: false, arrived: delivers });
-    });
+  const order = store.order(body.orderId);
+
+  if (!order) {
+    return reject(
+      body,
+      ctx,
+      "NOT_FOUND",
+      `order ${body.orderId} is unknown to dispatch`,
+      nowMs,
+    );
+  }
+
+  const steps = trust.range(body, order.progress);
+  if (!steps.ok) return steps;
+
+  let at: Journey | undefined;
+  let delivers = false;
+
+  if (steps.value !== undefined) {
+    const { from, to: target } = steps.value;
+
+    delivers =
+      from <= stepIndex("delivered") &&
+      target >= stepIndex("delivered");
+
+    at = journeyOf(order, body);
+
+    // Validate before consuming the callback ID.
+    if (delivers && at.nodeId === undefined) {
+      return err(
+        sudsnikError(
+          "CONFLICT",
+          `order ${order.order_id} has no node to be delivered to`,
+        ),
+      );
+    }
+  }
+
+  if (
+    !trust.fresh(
+      {
+        id: body.id,
+        tenantId: ctx.tenantId,
+        kind: body.kind,
+        orderId: body.orderId,
+      },
+      nowMs,
+    )
+  ) {
+    return ok({ duplicate: true, arrived: false });
+  }
+
+  if (steps.value === undefined) {
+    return ok({ duplicate: true, arrived: false });
+  }
+
+  const { from, to: target } = steps.value;
+
+  for (let i = from; i <= target; i++) {
+    applyStep(order, STEPS[i - 1]!, body, ctx, nowMs, at!);
+  }
+
+  if (target > order.progress) {
+    store.setProgress(order.order_id, target, nowMs);
+  }
+
+  return ok({ duplicate: false, arrived: delivers });
+});
   }
 
   return {
