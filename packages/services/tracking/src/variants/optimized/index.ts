@@ -134,26 +134,12 @@ function service(parts: Parts) {
       );
     }
 
-    const entry = cache.get(key);
-    const liveEntry =
-      entry && entry.expiresAt > now ? entry : undefined;
+    cache.set(key, {
+      position: stored,
+      expiresAt: now + ttlMs,
+    });
 
-    // Use a live, newer memory entry; otherwise fall back to SQLite.
-    const latest =
-      liveEntry &&
-      liveEntry.position.observedAt > stored.observedAt
-        ? liveEntry.position
-        : stored;
-
-    // Rebuild the memory cache from the persisted position when needed.
-    if (
-      !liveEntry ||
-      latest.observedAt > liveEntry.position.observedAt
-    ) {
-      remember(ctx, latest);
-    }
-
-    return ok(cached(latest));
+    return ok(cached(stored));
   }
 
   return {
