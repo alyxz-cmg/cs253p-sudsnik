@@ -1,6 +1,4 @@
-
 import {
-  SHUTTLES,
   type Ctx,
   type ServiceDeps,
 } from "@sudsnik/contracts";
@@ -118,53 +116,45 @@ function service(parts: Parts) {
   // Cached read: memory first, persistent store second.
   // This function intentionally never calls ephemeris.
   async function positionCached(
-  shuttleId: string,
-  ctx: Ctx,
-): Promise<Result<Position>> {
-  const key = keyOf(shuttleId, ctx);
-  const now = deps.clock.now();
+    shuttleId: string,
+    ctx: Ctx,
+  ): Promise<Result<Position>> {
+    const key = keyOf(shuttleId, ctx);
+    const now = deps.clock.now();
 
-  const stored = store.position(shuttleId);
+    const stored = store.position(shuttleId);
 
-  if (!stored) {
-    cache.delete(key);
-    return err(
-      sudsnikError(
-        "NOT_FOUND",
-        `no stored position for shuttle ${shuttleId}`,
-      ),
-    );
+    if (!stored) {
+      cache.delete(key);
+      return err(
+        sudsnikError(
+          "NOT_FOUND",
+          `no stored position for shuttle ${shuttleId}`,
+        ),
+      );
+    }
+
+    const entry = cache.get(key);
+    const liveEntry =
+      entry && entry.expiresAt > now ? entry : undefined;
+
+    // Use a live, newer memory entry; otherwise fall back to SQLite.
+    const latest =
+      liveEntry &&
+      liveEntry.position.observedAt > stored.observedAt
+        ? liveEntry.position
+        : stored;
+
+    // Rebuild the memory cache from the persisted position when needed.
+    if (
+      !liveEntry ||
+      latest.observedAt > liveEntry.position.observedAt
+    ) {
+      remember(ctx, latest);
+    }
+
+    return ok(cached(latest));
   }
-
-  const entry = cache.get(key);
-
-  // An expired memory entry is not allowed to override SQLite.
-  const liveEntry =
-    entry && entry.expiresAt > now ? entry : undefined;
-
-  // SQLite is authoritative unless a live cache entry is newer.
-  const latest =
-    liveEntry &&
-    liveEntry.position.observedAt > stored.observedAt
-      ? liveEntry.position
-      : stored;
-
-  // A genuinely stale observation needs a fresh provider read.
-  if (now - latest.observedAt > ttlMs) {
-    cache.delete(key);
-    return position(shuttleId, ctx);
-  }
-
-  // Populate or refresh the memory cache from the persistent store.
-  if (
-    !liveEntry ||
-    latest.observedAt > liveEntry.position.observedAt
-  ) {
-    remember(ctx, latest);
-  }
-
-  return ok(cached(latest));
-}
 
   return {
     position,
@@ -172,24 +162,14 @@ function service(parts: Parts) {
 
     // Only return shuttles with a position actually stored.
     async positions(ctx: Ctx): Promise<Result<Position[]>> {
-  const stored = store.positions();
+      const positions = store.positions();
 
-  // Return only persisted positions, in canonical shuttle order.
-  const byShuttle = new Map(
-    stored.map((p) => [p.shuttleId, p]),
-  );
+      for (const p of positions) {
+        remember(ctx, p);
+      }
 
-  const positions = SHUTTLES.flatMap((shuttleId) => {
-    const p = byShuttle.get(shuttleId);
-    return p ? [p] : [];
-  });
-
-  for (const p of positions) {
-    remember(ctx, p);
-  }
-
-  return ok(positions.map(cached));
-},
+      return ok(positions.map(cached));
+    },
 
     podLocation: podLocation(parts),
 

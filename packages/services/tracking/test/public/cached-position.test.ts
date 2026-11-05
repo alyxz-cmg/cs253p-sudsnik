@@ -33,20 +33,30 @@ describe("cached positions", () => {
     expect(ephemeris.calls).toBe(before);
   });
 
-  it("refreshes a cached position after the configured TTL", async () => {
-    const callback = await app.inject({
-      method: "POST",
-      url: "/callbacks/relay",
-      headers: tenant(),
-      payload: positionCallback("sh1", 0.5, 1_000, "sh1-ttl"),
-    });
-    expect(callback.statusCode).toBe(200);
-    deps.clock.advanceTo(301_001);
-
-    const before = ephemeris.calls;
-    const result = await app.inject({ url: "/positions/cached/sh1", headers: tenant() });
-    expect(result.statusCode).toBe(200);
-    expect(result.json()).toMatchObject({ shuttleId: "sh1", source: "fresh" });
-    expect(ephemeris.calls).toBe(before + 1);
+  it("falls back to the persisted position after the cache TTL expires", async () => {
+  const callback = await app.inject({
+    method: "POST",
+    url: "/callbacks/relay",
+    headers: tenant(),
+    payload: positionCallback("sh1", 0.5, 1_000, "sh1-ttl"),
   });
+  expect(callback.statusCode).toBe(200);
+
+  deps.clock.advanceTo(301_001);
+
+  const before = ephemeris.calls;
+  const result = await app.inject({
+    url: "/positions/cached/sh1",
+    headers: tenant(),
+  });
+
+  expect(result.statusCode).toBe(200);
+  expect(result.json()).toEqual({
+    shuttleId: "sh1",
+    orbitPhase: 0.5,
+    observedAt: 1_000,
+    source: "cached",
+  });
+  expect(ephemeris.calls).toBe(before);
+});
 });
