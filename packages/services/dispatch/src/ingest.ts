@@ -1,4 +1,8 @@
-import type { Ctx, ServiceDeps } from "@sudsnik/contracts";
+import {
+  SYSTEM_TENANT,
+  type Ctx,
+  type ServiceDeps,
+} from "@sudsnik/contracts";
 import type { RelayCallback } from "@sudsnik/contracts/mocks/relay";
 import type { RelayIngest } from "@sudsnik/contracts/services/dispatch";
 import type { Db } from "@sudsnik/infra-db";
@@ -113,7 +117,10 @@ export function createIngest(parts: IngestParts): Ingest {
 
   function applyPod(body: PodCallback, ctx: Ctx, nowMs: number): Result<{ duplicate: boolean; arrived: boolean }> {
     return db.transaction((): Result<{ duplicate: boolean; arrived: boolean }> => {
-  const order = store.order(body.orderId, ctx.tenantId);
+  const order = store.order(
+      body.orderId,
+      ctx.tenantId === SYSTEM_TENANT ? undefined : ctx.tenantId,
+    );
 
   if (!order) {
     return reject(
@@ -145,7 +152,21 @@ export function createIngest(parts: IngestParts): Ingest {
       return reject(body, ctx, "CONFLICT", `order ${order.order_id} has no node to be delivered to`, nowMs);
     }
   }
-  if (steps.value === undefined) {
+  const fresh = trust.fresh(
+      {
+        id: body.id,
+        tenantId: order.tenant_id,
+        kind: body.kind,
+        orderId: body.orderId,
+      },
+      nowMs,
+    );
+
+    if (!fresh) {
+      return ok({ duplicate: true, arrived: false });
+    }
+
+    if (steps.value === undefined) {
     return ok({ duplicate: true, arrived: false });
   }
 

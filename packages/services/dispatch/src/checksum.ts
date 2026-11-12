@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-function canonicalJson(value: unknown): string {
+export function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) {
     return `[${value.map(canonicalJson).join(",")}]`;
   }
@@ -18,17 +18,20 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-export function checksumVerifies(
-  body: Record<string, unknown>,
-): boolean {
-  if (typeof body.checksum !== "string") return false;
-
+export function checksumOf(body: Record<string, unknown>): string {
   const { checksum: _omitted, ...rest } = body;
 
-  const expected = createHash("sha256")
+  return createHash("sha256")
     .update(canonicalJson(rest))
     .digest("hex")
     .slice(0, 8);
+}
 
-  return body.checksum === expected;
+export function checksumVerifies(
+  body: Record<string, unknown>,
+): boolean {
+  return (
+    typeof body.checksum === "string" &&
+    body.checksum === checksumOf(body)
+  );
 }

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import type { PayloadOf } from "@sudsnik/contracts";
+import { type PayloadOf, SYSTEM_TENANT } from "@sudsnik/contracts";
 import { createApp } from "../../src/index.js";
 import { buildCallback, buildDeps, buildOrderCancelled, buildOrderPlaced, buildWashCompleted, relayHeaders, stubClients } from "../support/builders.js";
 
@@ -209,6 +209,30 @@ it("scopes callback repeat IDs to their tenant", async () => {
   expect(first.json()).toEqual({ accepted: true, duplicate: false });
   expect(second.statusCode).toBe(200);
   expect(second.json()).toEqual({ accepted: true, duplicate: false });
+});
+
+
+it("accepts simulator callbacks delivered under the system tenant", async () => {
+  const { deps, app, orderId, podId } = await placed();
+
+  const res = await app.inject({
+    method: "POST",
+    url: "/callbacks/relay",
+    headers: relayHeaders(SYSTEM_TENANT),
+    payload: buildCallback("collected", {
+      orderId,
+      podId,
+      shuttleId: "sh1",
+      atMs: 100,
+    }),
+  });
+
+  expect(res.statusCode).toBe(200);
+  expect(res.json()).toEqual({
+    accepted: true,
+    duplicate: false,
+  });
+  expect(deps.bus.ofTopic("pod.collected")).toHaveLength(1);
 });
 
 });
