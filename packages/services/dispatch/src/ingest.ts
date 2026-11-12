@@ -144,7 +144,7 @@ export function createIngest(parts: IngestParts): Ingest {
     if (delivers && at.nodeId === undefined) {
       return reject(body, ctx, "CONFLICT", `order ${order.order_id} has no node to be delivered to`, nowMs);
     }
-
+  }
   if (steps.value === undefined) {
     return ok({ duplicate: true, arrived: false });
   }

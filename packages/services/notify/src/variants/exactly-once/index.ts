@@ -71,3 +71,12 @@ export function runtime(w: Wiring): VariantRuntime {
 export function createApp(deps: ServiceDeps): Promise<NotifyApp> {
   return createServiceApp(deps, { variant, runtime, alertsDir });
 }
+
+export function start(): Promise<unknown> {
+  return bootService({
+    service: "notify",
+    readEnv,
+    createApp,
+    handlersDir,
+  });
+}
