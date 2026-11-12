@@ -75,8 +75,16 @@ export function createScheduler(parts: SchedulerParts): Scheduler {
   let queuedPending = true;
   const queueHasWork = () => queuedPending;
 
-  const pickupCtx = (order: OrderRow): Ctx => ({ tenantId: order.tenant_id, correlationId: order.correlation_id, idempotencyKey: `${order.order_id}:pickup:${order.attempts}` });
-  const holdCtx = (order: OrderRow): Ctx => ({ tenantId: order.tenant_id, correlationId: order.correlation_id, idempotencyKey: `${order.order_id}:hold:${order.hold_attempts}` });
+  const pickupCtx = (order: OrderRow): Ctx => ({
+    tenantId: order.tenant_id,
+    correlationId: order.correlation_id,
+    idempotencyKey: `${order.order_id}:pickup:${order.attempts}`,
+  });
+  const holdCtx = (order: OrderRow): Ctx => ({
+    tenantId: order.tenant_id,
+    correlationId: order.correlation_id,
+    idempotencyKey: `${order.order_id}:hold:${order.hold_attempts}`,
+  });
 
   async function planPickup(order: OrderRow, ctx: Ctx, replace?: AssignmentRow): Promise<Result<Assignment>> {
     if (strategy.beforePickup) {
@@ -92,16 +100,37 @@ export function createScheduler(parts: SchedulerParts): Scheduler {
 
     const row = db.transaction(() => {
       if (replace) store.setAssignmentState(replace.id, "cancelled", nowMs);
-      const shuttleId = chooseShuttle(store, { habitatId: order.habitat_id, nodeId, windowStart: window.value.startMs });
+      const shuttleId = chooseShuttle(store, {
+        habitatId: order.habitat_id,
+        nodeId,
+        windowStart: window.value.startMs,
+      });
       const a = store.insertAssignment(
-        { orderId: order.order_id, tenantId: order.tenant_id, leg: "pickup", shuttleId, nodeId, holdId: undefined, windowStart: window.value.startMs, windowEnd: window.value.endMs },
+        {
+          orderId: order.order_id,
+          tenantId: order.tenant_id,
+          leg: "pickup",
+          shuttleId,
+          nodeId,
+          holdId: undefined,
+          windowStart: window.value.startMs,
+          windowEnd: window.value.endMs,
+        },
         nowMs,
       );
       store.setOrderState(order.order_id, "scheduled", nowMs);
       publisher.enqueue(
         "pickup.scheduled",
         order.tenant_id,
-        { orderId: order.order_id, podId: order.pod_id, habitatId: order.habitat_id, nodeId, shuttleId, windowStart: a.window_start, windowEnd: a.window_end },
+        {
+          orderId: order.order_id,
+          podId: order.pod_id,
+          habitatId: order.habitat_id,
+          nodeId,
+          shuttleId,
+          windowStart: a.window_start,
+          windowEnd: a.window_end,
+        },
         { correlationId: ctx.correlationId, causationId: ctx.idempotencyKey ?? order.order_id },
       );
       return a;
@@ -115,7 +144,13 @@ export function createScheduler(parts: SchedulerParts): Scheduler {
     const pickup = store.currentAssignment(order.order_id, "pickup");
     if (!pickup) return err(sudsnikError("CONFLICT", `order ${order.order_id} has no pickup to hold for`));
     const nowMs = deps.clock.now();
-    const hold = await acquireHold(deps.clients.washnodes, store, { orderId: order.order_id, tenantId: order.tenant_id, nodeId: pickup.node_id }, ctx, nowMs);
+    const hold = await acquireHold(
+      deps.clients.washnodes,
+      store,
+      { orderId: order.order_id, tenantId: order.tenant_id, nodeId: pickup.node_id },
+      ctx,
+      nowMs,
+    );
     if (!hold.ok) return hold;
     db.transaction(() => {
       store.setAssignmentHold(pickup.id, hold.value.hold_id, hold.value.node_id, nowMs);
@@ -123,7 +158,13 @@ export function createScheduler(parts: SchedulerParts): Scheduler {
       publisher.enqueue(
         "pod.delivered",
         order.tenant_id,
-        { orderId: order.order_id, podId: order.pod_id, nodeId: hold.value.node_id, holdId: hold.value.hold_id, deliveredAt: order.delivered_at ?? nowMs },
+        {
+          orderId: order.order_id,
+          podId: order.pod_id,
+          nodeId: hold.value.node_id,
+          holdId: hold.value.hold_id,
+          deliveredAt: order.delivered_at ?? nowMs,
+        },
         { correlationId: ctx.correlationId, causationId: ctx.idempotencyKey ?? order.order_id },
       );
     });
@@ -239,7 +280,14 @@ export function createScheduler(parts: SchedulerParts): Scheduler {
       const fresh = db.transaction(() => {
         if (!store.consumeEvent(envelope.id, envelope.topic, nowMs)) return false;
         store.insertOrder(
-          { orderId: p.orderId, tenantId: envelope.tenantId, habitatId: p.habitatId, podId: p.podId, requestedAt: p.requestedAt, correlationId: envelope.correlationId },
+          {
+            orderId: p.orderId,
+            tenantId: envelope.tenantId,
+            habitatId: p.habitatId,
+            podId: p.podId,
+            requestedAt: p.requestedAt,
+            correlationId: envelope.correlationId,
+          },
           nowMs,
         );
         return true;
@@ -277,28 +325,47 @@ export function createScheduler(parts: SchedulerParts): Scheduler {
       const pickup = store.currentAssignment(orderId, "pickup");
       const nodeId = hint.nodeId ?? pickup?.node_id;
       if (!nodeId) return err(sudsnikError("CONFLICT", `order ${orderId} has no node to return from`));
+
       const contact = await strategy.inContact(nodeId, ctx);
-      // A provider outage or exhausted ephemeris quota must not make wash.completed
-      // retry until the bus dead-letters it. A future return window is safe.
-      if (!contact.ok && contact.error.code !== "QUOTA" && contact.error.code !== "UNAVAILABLE") return contact;
-      const nowMs = deps.clock.now();
-      const inContact = contact.ok && contact.value;
       if (!contact.ok) {
+        if (!strategy.queueForever && contact.error.code !== "QUOTA") {
+          return contact;
+        }
         log.warn("return_contact_deferred", { orderId, nodeId, error: contact.error.message });
       }
+
+      const nowMs = deps.clock.now();
+      const inContact = contact.ok && contact.value;
       const windowStart = inContact ? nowMs : nowMs + CONTACT_RETRY_MS;
       const hold = store.activeHold(orderId);
       const row = db.transaction(() => {
         const shuttleId = chooseShuttle(store, { habitatId: order.habitat_id, nodeId, windowStart });
         const a = store.insertAssignment(
-          { orderId, tenantId: order.tenant_id, leg: "return", shuttleId, nodeId, holdId: hold?.hold_id, windowStart, windowEnd: windowStart + LINK_WINDOW_MS },
+          {
+            orderId,
+            tenantId: order.tenant_id,
+            leg: "return",
+            shuttleId,
+            nodeId,
+            holdId: hold?.hold_id,
+            windowStart,
+            windowEnd: windowStart + LINK_WINDOW_MS,
+          },
           nowMs,
         );
         if (hold) store.setHoldState(hold.hold_id, "consumed", nowMs);
         publisher.enqueue(
           "return.scheduled",
           order.tenant_id,
-          { orderId, podId: order.pod_id, habitatId: order.habitat_id, nodeId, shuttleId, windowStart: a.window_start, windowEnd: a.window_end },
+          {
+            orderId,
+            podId: order.pod_id,
+            habitatId: order.habitat_id,
+            nodeId,
+            shuttleId,
+            windowStart: a.window_start,
+            windowEnd: a.window_end,
+          },
           { correlationId: ctx.correlationId, causationId: ctx.idempotencyKey ?? orderId },
         );
         return a;
@@ -310,7 +377,9 @@ export function createScheduler(parts: SchedulerParts): Scheduler {
     async reassign(orderId, ctx) {
       const order = store.order(orderId);
       if (!order) return notPlaced(orderId);
-      if (order.state === "cancelled" || order.state === "returned" || order.state === "failed") return err(sudsnikError("CONFLICT", `order ${orderId} is ${order.state}`));
+      if (order.state === "cancelled" || order.state === "returned" || order.state === "failed") {
+        return err(sudsnikError("CONFLICT", `order ${orderId} is ${order.state}`));
+      }
       const nowMs = deps.clock.now();
       if (order.state === "arrived" || order.state === "waiting" || order.state === "holding" || order.state === "held") {
         // The pod is at the node: a fresh hold there, and pod.delivered again so washnodes starts on the new washer.
