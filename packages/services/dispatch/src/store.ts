@@ -116,8 +116,17 @@ export function createStore(db: Db) {
       return db.readOne("select 1 from consumed_events where envelope_id = ? and topic = ?", envelopeId, topic) !== undefined;
     },
 
-    order(orderId: string): OrderRow | undefined {
-      return db.readOne<OrderRow>("select * from orders where order_id = ?", orderId);
+    order(orderId: string, tenantId?: string): OrderRow | undefined {
+      return tenantId === undefined
+        ? db.readOne<OrderRow>("select * from orders where order_id = ?", orderId)
+        : db.readOne<OrderRow>("select * from orders where order_id = ? and tenant_id = ?", orderId, tenantId);
+    },
+    /** Non-terminal orders that have not changed since the supplied simulated time. */
+    stalledOrders(olderThanMs: number): OrderRow[] {
+      return db.read<OrderRow>(
+        "select * from orders where state not in ('failed', 'returned', 'cancelled') and updated_at <= ? order by updated_at, order_id",
+        olderThanMs,
+      );
     },
     insertOrder(o: { orderId: string; tenantId: string; habitatId: string; podId: string; requestedAt: number; correlationId: string }, nowMs: number): boolean {
       return (
@@ -303,7 +312,7 @@ export function createStore(db: Db) {
     },
     rejectCallback(r: { callbackId: string | undefined; tenantId: string; reason: string; body: unknown }, nowMs: number): void {
       db.write(
-        "insert into rejected_callbacks (callback_id, tenant_id, reason, body, received_at) values (?, ?, ?, ?, ?)",
+        "insert or ignore into rejected_callbacks (callback_id, tenant_id, reason, body, received_at) values (?, ?, ?, ?, ?)",
         r.callbackId ?? null,
         r.tenantId,
         r.reason,

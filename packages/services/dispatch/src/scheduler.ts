@@ -278,9 +278,15 @@ export function createScheduler(parts: SchedulerParts): Scheduler {
       const nodeId = hint.nodeId ?? pickup?.node_id;
       if (!nodeId) return err(sudsnikError("CONFLICT", `order ${orderId} has no node to return from`));
       const contact = await strategy.inContact(nodeId, ctx);
-      if (!contact.ok) return contact;
+      // A provider outage or exhausted ephemeris quota must not make wash.completed
+      // retry until the bus dead-letters it. A future return window is safe.
+      if (!contact.ok && contact.error.code !== "QUOTA" && contact.error.code !== "UNAVAILABLE") return contact;
       const nowMs = deps.clock.now();
-      const windowStart = contact.value ? nowMs : nowMs + CONTACT_RETRY_MS;
+      const inContact = contact.ok && contact.value;
+      if (!contact.ok) {
+        log.warn("return_contact_deferred", { orderId, nodeId, error: contact.error.message });
+      }
+      const windowStart = inContact ? nowMs : nowMs + CONTACT_RETRY_MS;
       const hold = store.activeHold(orderId);
       const row = db.transaction(() => {
         const shuttleId = chooseShuttle(store, { habitatId: order.habitat_id, nodeId, windowStart });

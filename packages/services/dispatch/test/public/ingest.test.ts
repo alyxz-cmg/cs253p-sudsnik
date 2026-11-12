@@ -175,4 +175,40 @@ it("rejects a callback whose checksum does not verify", async () => {
   expect((await post(invalid)).statusCode).toBe(400);
 });
 
+
+it("scopes callback repeat IDs to their tenant", async () => {
+  const deps = buildDeps();
+  stubClients(deps);
+  const app = await createApp(deps);
+  apps.push(app);
+
+  const orderA = buildOrderPlaced({ orderId: "tenant-a-order", tenantId: "op1" });
+  const orderB = buildOrderPlaced({ orderId: "tenant-b-order", tenantId: "op2" });
+  await deps.bus.deliver(orderA);
+  await deps.bus.deliver(orderB);
+
+  const callbackA = buildCallback("collected", {
+    id: "shared-relay-id",
+    orderId: orderA.payload.orderId,
+    podId: orderA.payload.podId,
+    shuttleId: "sh1",
+    atMs: 100,
+  });
+  const callbackB = buildCallback("collected", {
+    id: "shared-relay-id",
+    orderId: orderB.payload.orderId,
+    podId: orderB.payload.podId,
+    shuttleId: "sh1",
+    atMs: 100,
+  });
+
+  const first = await app.inject({ method: "POST", url: "/callbacks/relay", headers: relayHeaders("op1"), payload: callbackA });
+  const second = await app.inject({ method: "POST", url: "/callbacks/relay", headers: relayHeaders("op2"), payload: callbackB });
+
+  expect(first.statusCode).toBe(200);
+  expect(first.json()).toEqual({ accepted: true, duplicate: false });
+  expect(second.statusCode).toBe(200);
+  expect(second.json()).toEqual({ accepted: true, duplicate: false });
+});
+
 });

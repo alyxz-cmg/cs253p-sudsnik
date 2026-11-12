@@ -26,7 +26,7 @@ export interface Wiring {
 export interface VariantRuntime extends Runtime, NotifyService {
   /** Runs (or joins) one pass over queued notifications; tests await it after advancing the clock. */
   sweep(): Promise<void>;
-  stop(): void;
+  stop(): Promise<void> | void;
 }
 
 export interface VariantSpec {

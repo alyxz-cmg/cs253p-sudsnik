@@ -65,7 +65,7 @@ export interface SweepOptions {
 }
 
 /** One pass over due notifications, at most one in flight; skips the read while nothing is known to be pending. */
-export function sweeper(o: SweepOptions): { sweep(): Promise<void>; notePending(): void } {
+export function sweeper(o: SweepOptions): { sweep(): Promise<void>; notePending(): void; stop(): Promise<void> } {
   const { store, deps } = o.w;
   let inFlight: Promise<void> | undefined;
   let maybePending = store.pendingCount() > 0;
@@ -74,6 +74,10 @@ export function sweeper(o: SweepOptions): { sweep(): Promise<void>; notePending(
     const now = deps.clock.now();
     let pending = false;
     for (const row of store.undelivered()) {
+      if (row.not_before > now || !inLinkWindow(row.habitat_id, now)) {
+        pending = true;
+        continue;
+      }
       const outcome = await o.deliver({ notification: row, now, attempt: 0 });
       if (stillPending(outcome)) pending = true;
     }
@@ -86,6 +90,7 @@ export function sweeper(o: SweepOptions): { sweep(): Promise<void>; notePending(
       return inFlight;
     },
     notePending: () => void (maybePending = true),
+    stop: async () => { if (inFlight) await inFlight; },
   };
 }
 

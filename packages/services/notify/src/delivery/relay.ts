@@ -46,6 +46,10 @@ export function deliverRequest(n: NotificationRow, now: number): DeliverRequest 
 export function send(ctx: DeliveryContext): Stage<DeliveryState> {
   return stage("send", async (s) => {
     const n = s.notification;
+    // Do not spend an attempt before Retry-After expires or outside the habitat's link window.
+    if (n.not_before > s.now) return halt("retry-after hold has not expired");
+    if (!inLinkWindow(n.habitat_id, s.now)) return halt("habitat is outside its link window");
+
     const attempt = n.attempts + 1;
     const result = await ctx.deps.clients.relay.deliver(deliverRequest(n, s.now), {
       tenantId: n.tenant_id,

@@ -33,6 +33,7 @@ export const variant = "optimized";
 export const handlersDir = fileURLToPath(
   new URL("../../handlers/", import.meta.url),
 );
+export const alertsDir = fileURLToPath(new URL("../../alerts/", import.meta.url));
 
 export const STATUS_TTL_MS = 300_000;
 
@@ -264,5 +265,5 @@ export function optimizedStrategy(
 }
 
 export function createApp(deps: ServiceDeps) {
-  return buildApp(deps, variant, optimizedStrategy);
+  return buildApp(deps, variant, optimizedStrategy, alertsDir);
 }

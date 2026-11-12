@@ -1,5 +1,5 @@
 import { fileURLToPath } from "node:url";
-import { IdSchema, IdempotencyHeaders, type CostResponse, type ServiceDeps } from "@sudsnik/contracts";
+import { IdSchema, IdempotencyHeaders, MINUTE_MS, ORBIT_MS, type CostResponse, type ServiceDeps } from "@sudsnik/contracts";
 import { Assignment, routes } from "@sudsnik/contracts/services/dispatch";
 import { z } from "zod";
 import { serviceDataFile } from "@sudsnik/infra-boot";
@@ -87,6 +87,11 @@ export async function buildApp(deps: ServiceDeps, variant: string, strategy: Str
   const log = deps.telemetry.logger;
   app.sudsnik.registerStop(everyGuarded(deps.clock, PICKUP_PUMP_EVERY_MS, "pickup_pump", () => (scheduler.queueHasWork() ? gate.sweep(() => scheduler.pumpPickups()) : undefined), log));
   app.sudsnik.registerStop(everyGuarded(deps.clock, WASHER_SWEEP_MS, "washer_sweep", () => gate.sweep(() => scheduler.pumpArrivals()), log));
+  app.sudsnik.registerStop(everyGuarded(deps.clock, MINUTE_MS, "stalled_order_watch", () =>
+    gate.sweep(async () => {
+      const stalled = store.stalledOrders(deps.clock.now() - 2 * ORBIT_MS);
+      if (stalled.length > 0) deps.telemetry.counter("dispatch.stalled_orders").add(stalled.length);
+    }), log));
   await scheduler.pumpPickups();
   await scheduler.pumpArrivals();
   app.sudsnik.setReady(true);

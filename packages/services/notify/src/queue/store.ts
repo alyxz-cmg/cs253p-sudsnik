@@ -153,7 +153,7 @@ export function createStore(db: Db) {
         }));
     },
 
-    // The sweep picks dead letters up again once an orbit and keeps trying until an operator clears them.
+    // Dead letters stay failed for operator review; notification.failed informs downstream consumers.
     deadLetter(notificationId: string, tenantId: string, attempts: number, reason: string, deadAt: number): void {
       db.write("insert or ignore into dead_letters (notification_id, tenant_id, attempts, reason, dead_at) values (?, ?, ?, ?, ?)", notificationId, tenantId, attempts, reason, deadAt);
     },

@@ -58,7 +58,12 @@ export function createIngest(parts: IngestParts): Ingest {
   const { deps, db, store, outbox, publisher, onArrived } = parts;
   const trust = parts.trust(store);
 
-  function reject(body: RelayCallback, ctx: Ctx, code: "INVALID" | "NOT_FOUND", reason: string, nowMs: number): Result<never> {
+  /** Counters read by the dispatch alert rules. */
+  const count = (name: string) => deps.telemetry.counter(`dispatch.${name}`).add(1);
+
+  function reject(body: RelayCallback, ctx: Ctx, code: "INVALID" | "NOT_FOUND" | "CONFLICT", reason: string, nowMs: number): Result<never> {
+    count("callback_rejected");
+    count("relay_anomalies");
     store.rejectCallback({ callbackId: body.id, tenantId: ctx.tenantId, reason, body }, nowMs);
     return err(sudsnikError(code, reason));
   }
@@ -103,14 +108,12 @@ export function createIngest(parts: IngestParts): Ingest {
     }
   }
 
-  /** Counters an alert rule can read: every callback, and what the relay did to it on the way. */
-  const count = (name: string) => deps.telemetry.counter(`dispatch.${name}`).add(1);
-  /** The latest event time any callback carried; one stamped earlier than it was delivered out of order. */
+    /** The latest event time any callback carried; one stamped earlier than it was delivered out of order. */
   let latestAtMs = 0;
 
   function applyPod(body: PodCallback, ctx: Ctx, nowMs: number): Result<{ duplicate: boolean; arrived: boolean }> {
     return db.transaction((): Result<{ duplicate: boolean; arrived: boolean }> => {
-  const order = store.order(body.orderId);
+  const order = store.order(body.orderId, ctx.tenantId);
 
   if (!order) {
     return reject(
@@ -123,7 +126,7 @@ export function createIngest(parts: IngestParts): Ingest {
   }
 
   const steps = trust.range(body, order.progress);
-  if (!steps.ok) return steps;
+  if (!steps.ok) return reject(body, ctx, "INVALID", steps.error.message, nowMs);
 
   let at: Journey | undefined;
   let delivers = false;
@@ -139,28 +142,8 @@ export function createIngest(parts: IngestParts): Ingest {
 
     // Validate before consuming the callback ID.
     if (delivers && at.nodeId === undefined) {
-      return err(
-        sudsnikError(
-          "CONFLICT",
-          `order ${order.order_id} has no node to be delivered to`,
-        ),
-      );
+      return reject(body, ctx, "CONFLICT", `order ${order.order_id} has no node to be delivered to`, nowMs);
     }
-  }
-
-  if (
-    !trust.fresh(
-      {
-        id: body.id,
-        tenantId: ctx.tenantId,
-        kind: body.kind,
-        orderId: body.orderId,
-      },
-      nowMs,
-    )
-  ) {
-    return ok({ duplicate: true, arrived: false });
-  }
 
   if (steps.value === undefined) {
     return ok({ duplicate: true, arrived: false });
@@ -184,20 +167,28 @@ export function createIngest(parts: IngestParts): Ingest {
     async accept(body, ctx) {
       const nowMs = deps.clock.now();
       count("callbacks");
-      if (body.atMs < latestAtMs) count("callback_out_of_order");
+      if (body.atMs < latestAtMs) {
+        count("callback_out_of_order");
+        count("relay_anomalies");
+      }
       latestAtMs = Math.max(latestAtMs, body.atMs);
       if (!trust.verify(body)) {
-        count("callback_rejected");
         return reject(body, ctx, "INVALID", "checksum does not verify", nowMs);
       }
       if (body.kind === "position") {
         // Shuttle positions are tracking's callback; one that reaches dispatch is acknowledged and not acted on.
         const duplicate = !trust.fresh({ id: body.id, tenantId: ctx.tenantId, kind: body.kind, orderId: undefined }, nowMs);
-        if (duplicate) count("callback_duplicates");
+        if (duplicate) {
+          count("callback_duplicates");
+          count("relay_anomalies");
+        }
         return ok({ duplicate });
       }
       const r = applyPod(body, ctx, nowMs);
-      if (r.ok && r.value.duplicate) count("callback_duplicates");
+      if (r.ok && r.value.duplicate) {
+        count("callback_duplicates");
+        count("relay_anomalies");
+      }
       if (!r.ok || r.value.duplicate) return r;
       await outbox.pump();
       // Only a callback that brought the pod to its node needs a hold; the others have nothing for the pump to do.
