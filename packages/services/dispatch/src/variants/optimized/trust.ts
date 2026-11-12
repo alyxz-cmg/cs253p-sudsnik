@@ -3,13 +3,22 @@ import type { IngestTrust, PodCallback } from "../../ingest.js";
 import { stepIndex } from "../../ingest.js";
 import type { Store } from "../../store.js";
 import { checksumVerifies } from "../../checksum.js";
+import { createHash } from "node:crypto";
 
+export function checksumOf(payload: any): string {
+  const copy = { ...payload };
+  delete copy.checksum;
+
+  const sortedKeys = Object.keys(copy).sort();
+  const canonical = JSON.stringify(copy, sortedKeys);
+
+  return createHash("sha256").update(canonical).digest("hex").slice(0, 8);
+}
 export function optimizedTrust(store: Store): IngestTrust {
   return {
     verify(body) {
-      return checksumVerifies(
-        body as unknown as Record<string, unknown>,
-      );
+      if (!body.checksum) return false;
+      return checksumOf(body) === body.checksum;
     },
 
     fresh(entry, nowMs) {
