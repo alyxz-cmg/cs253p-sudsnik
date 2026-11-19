@@ -135,8 +135,10 @@ describe("oracle triage workflow", () => {
       return ok(response(VALID, 1, 1));
     };
 
-    const first = await classify(b);
-    const second = await classify(b, "No obvious damage to the pod.");
+    const [first, second] = await Promise.all([
+      classify(b),
+      classify(b, "No obvious damage to the pod."),
+    ]);
     expect(first).toMatchObject({ ok: true, value: { tokens: 2 } });
     expect(second).toMatchObject({ ok: true, value: { tokens: 0 } });
     expect(calls).toBe(1);
