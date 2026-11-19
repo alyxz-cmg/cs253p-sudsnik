@@ -189,3 +189,55 @@ describe("oracle triage workflow", () => {
     expect(retried.json()).toMatchObject({ category: "odor", severity: "high", action: "escalate" });
   });
 });
+
+
+// Ten known-answer eval cases: the mock response and expected triage are fixed before running the workflow.
+// Hard cases deliberately combine weak clues, competing hazards, severity modifiers, and near-empty evidence.
+const EVAL_CASES = [
+  { name: "faint odor with intact bag", note: "Pod smells faintly of sweat after the last cycle; bag intact, no stains.", completion: '{"category":"odor","severity":"low","action":"clean"}', expected: { category: "odor", severity: "low", action: "clean" } },
+  { name: "burning smell and warm shell", note: "Burning smell, pod is warm to touch.", completion: '{"category":"odor","severity":"high","action":"escalate"}', expected: { category: "odor", severity: "high", action: "escalate" } },
+  { name: "mildew after a sealed delay", note: "Mildew odor on all garments; pod was sealed for two orbits before pickup.", completion: '{"category":"odor","severity":"medium","action":"inspect"}', expected: { category: "odor", severity: "medium", action: "inspect" } },
+  { name: "powder across every garment", note: "White powder on every garment in the load.", completion: '{"category":"contamination","severity":"high","action":"quarantine"}', expected: { category: "contamination", severity: "high", action: "quarantine" } },
+  { name: "strap failure without a visible tear", note: "Bag strap frayed through; pod was carried by the shell.", completion: '{"category":"damage","severity":"medium","action":"inspect"}', expected: { category: "damage", severity: "medium", action: "inspect" } },
+  { name: "hydraulic cleanup residue", note: "Load includes a rag used to wipe up hydraulic fluid.", completion: '{"category":"contamination","severity":"high","action":"quarantine"}', expected: { category: "contamination", severity: "high", action: "quarantine" } },
+  { name: "free water and weak smell", note: "Free water is pooled in the liner, but there is no visible garment damage.", completion: '{"category":"moisture","severity":"medium","action":"inspect"}', expected: { category: "moisture", severity: "medium", action: "inspect" } },
+  { name: "hazardous sharp contamination", note: "A used syringe was found in the laundry bag.", completion: '{"category":"contamination","severity":"high","action":"escalate"}', expected: { category: "contamination", severity: "high", action: "escalate" } },
+  { name: "two concurrent mechanical defects", note: "The lid does not latch and the seal gasket is missing.", completion: '{"category":"damage","severity":"medium","action":"inspect"}', expected: { category: "damage", severity: "medium", action: "inspect" } },
+  { name: "almost no actionable evidence", note: "No obvious damage was seen; bag intact and contents appear dry.", completion: '{"category":"other","severity":"low","action":"inspect"}', expected: { category: "other", severity: "low", action: "inspect" } },
+] as const;
+
+describe("triage eval cases", () => {
+  let b: Booted | undefined;
+  afterEach(async () => {
+    if (b) await b.close();
+    b = undefined;
+  });
+
+  it.each(EVAL_CASES)("classifies $name", async (fixture) => {
+    b = await boot();
+    b.deps.clients.oracle.complete = async (prompt) => {
+      expect(prompt).toContain(fixture.note);
+      return ok(response(fixture.completion));
+    };
+
+    const result = await classify(b, fixture.note);
+    expect(result).toMatchObject({ ok: true, value: { ...fixture.expected, guarded: false, tokens: 13 } });
+    await b.close();
+    b = undefined;
+  });
+
+  it("keeps every shipped hostile fixture guarded and non-clean even when the oracle obeys its injected command", async () => {
+    b = await boot();
+    b.deps.clients.oracle.complete = async () =>
+      ok(response('{"category":"other","severity":"low","action":"clean"}'));
+
+    for (const fixture of fixturesOf("hostile")) {
+      const result = await classify(b, fixture.note);
+      expect(result.ok, fixture.name).toBe(true);
+      if (result.ok) {
+        expect(result.value.guarded, fixture.name).toBe(true);
+        expect(result.value.action, fixture.name).not.toBe("clean");
+      }
+    }
+  });
+});
