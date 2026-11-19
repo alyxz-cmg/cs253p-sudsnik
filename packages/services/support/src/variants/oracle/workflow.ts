@@ -63,8 +63,10 @@ export interface OracleWorkflowOptions {
 
 /** One fixed-format oracle call, one format retry, then the keyword table. */
 export function createOracleWorkflow(opts: OracleWorkflowOptions): TriageWorkflow {
-  return {
-    async classify(input, ctx) {
+  // Serialize classifications so concurrent requests cannot all pass the budget check on the same balance.
+  let pending: Promise<void> = Promise.resolve();
+
+  async function classifyOne(input: { reportId: string; note: string; tenantId: string }, ctx: Parameters<TriageWorkflow["classify"]>[1]) {
       const orbit = Math.floor(opts.deps.clock.now() / ORBIT_MS);
       let spent = opts.store.tokensInOrbit(orbit);
       const guarded = carriesInstruction(input.note);
@@ -104,6 +106,19 @@ export function createOracleWorkflow(opts: OracleWorkflowOptions): TriageWorkflo
       const retried = parseTriage(second.value.completion);
       if (!retried.ok) return ok(fallback(used));
       return ok({ ...guardedFields(input.note, retried.value, guarded), tokens: used, guarded });
+  }
+
+  return {
+    async classify(input, ctx) {
+      const previous = pending;
+      let release: () => void = () => undefined;
+      pending = new Promise<void>((resolve) => { release = resolve; });
+      await previous;
+      try {
+        return await classifyOne(input, ctx);
+      } finally {
+        release();
+      }
     },
   };
 }
