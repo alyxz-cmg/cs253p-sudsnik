@@ -123,12 +123,6 @@ describe("oracle triage workflow", () => {
 
   it("stops calling when the orbit budget is spent and resumes in the next orbit", async () => {
     b = await boot({ env: { SUDSNIK_SUPPORT_TOKEN_BUDGET_PER_ORBIT: "2" } });
-    let nowMs = 0;
-    b.deps.clock = {
-      now: () => nowMs,
-      after: async () => undefined,
-      every: () => () => undefined,
-    };
     let calls = 0;
     b.deps.clients.oracle.complete = async () => {
       calls++;
@@ -143,7 +137,7 @@ describe("oracle triage workflow", () => {
     expect(second).toMatchObject({ ok: true, value: { tokens: 0 } });
     expect(calls).toBe(1);
 
-    nowMs = 90 * 60_000;
+    b.deps.clock.advanceTo(90 * 60_000);
     const nextOrbit = await classify(b);
     expect(nextOrbit).toMatchObject({ ok: true, value: { tokens: 2 } });
     expect(calls).toBe(2);
