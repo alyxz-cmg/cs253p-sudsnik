@@ -66,53 +66,58 @@ export function createOracleWorkflow(opts: OracleWorkflowOptions): TriageWorkflo
   // Serialize classifications so concurrent requests cannot all pass the budget check on the same balance.
   let pending: Promise<void> = Promise.resolve();
 
-  async function classifyOne(input: { reportId: string; note: string; tenantId: string }, ctx: Parameters<TriageWorkflow["classify"]>[1]) {
-      const orbit = Math.floor(opts.deps.clock.now() / ORBIT_MS);
-      let spent = opts.store.tokensInOrbit(orbit);
-      const guarded = carriesInstruction(input.note);
-      const fallback = (tokens: number) => ({
-        ...guardedFields(input.note, classifyByKeywords(input.note), guarded),
-        tokens,
-        guarded,
-      });
+  async function classifyOne(
+    input: Parameters<TriageWorkflow["classify"]>[0],
+    ctx: Parameters<TriageWorkflow["classify"]>[1],
+  ): ReturnType<TriageWorkflow["classify"]> {
+    const orbit = Math.floor(opts.deps.clock.now() / ORBIT_MS);
+    let spent = opts.store.tokensInOrbit(orbit);
+    const guarded = carriesInstruction(input.note);
+    const fallback = (tokens: number) => ({
+      ...guardedFields(input.note, classifyByKeywords(input.note), guarded),
+      tokens,
+      guarded,
+    });
 
-      // A spent orbit uses the deterministic classifier without contacting the oracle.
-      if (spent >= opts.env.SUDSNIK_SUPPORT_TOKEN_BUDGET_PER_ORBIT) return ok(fallback(0));
+    // A spent orbit uses the deterministic classifier without contacting the oracle.
+    if (spent >= opts.env.SUDSNIK_SUPPORT_TOKEN_BUDGET_PER_ORBIT) return ok(fallback(0));
 
-      const recordUsage = (response: { promptTokens: number; completionTokens: number }): number => {
-        const used = response.promptTokens + response.completionTokens;
-        if (used > 0) {
-          opts.store.addTokens(orbit, used);
-          opts.deps.meter.charge("LLM_TOKEN", used, { service: opts.deps.service });
-        }
-        spent += used;
-        return used;
-      };
-
-      const first = await opts.deps.clients.oracle.complete(firstPrompt(input.note), MAX_COMPLETION_TOKENS, ctx);
-      if (!first.ok) return err(first.error);
-      let used = recordUsage(first.value);
-      const parsed = parseTriage(first.value.completion);
-      if (parsed.ok) {
-        return ok({ ...guardedFields(input.note, parsed.value, guarded), tokens: used, guarded });
+    const recordUsage = (response: { promptTokens: number; completionTokens: number }): number => {
+      const used = response.promptTokens + response.completionTokens;
+      if (used > 0) {
+        opts.store.addTokens(orbit, used);
+        opts.deps.meter.charge("LLM_TOKEN", used, { service: opts.deps.service });
       }
+      spent += used;
+      return used;
+    };
 
-      // Do not spend a retry once the first completion has exhausted this orbit's allowance.
-      if (spent >= opts.env.SUDSNIK_SUPPORT_TOKEN_BUDGET_PER_ORBIT) return ok(fallback(used));
+    const first = await opts.deps.clients.oracle.complete(firstPrompt(input.note), MAX_COMPLETION_TOKENS, ctx);
+    if (!first.ok) return err(first.error);
+    let used = recordUsage(first.value);
+    const parsed = parseTriage(first.value.completion);
+    if (parsed.ok) {
+      return ok({ ...guardedFields(input.note, parsed.value, guarded), tokens: used, guarded });
+    }
 
-      const second = await opts.deps.clients.oracle.complete(retryPrompt(input.note), MAX_COMPLETION_TOKENS, ctx);
-      if (!second.ok) return err(second.error);
-      used += recordUsage(second.value);
-      const retried = parseTriage(second.value.completion);
-      if (!retried.ok) return ok(fallback(used));
-      return ok({ ...guardedFields(input.note, retried.value, guarded), tokens: used, guarded });
+    // Do not spend a retry once the first completion has exhausted this orbit's allowance.
+    if (spent >= opts.env.SUDSNIK_SUPPORT_TOKEN_BUDGET_PER_ORBIT) return ok(fallback(used));
+
+    const second = await opts.deps.clients.oracle.complete(retryPrompt(input.note), MAX_COMPLETION_TOKENS, ctx);
+    if (!second.ok) return err(second.error);
+    used += recordUsage(second.value);
+    const retried = parseTriage(second.value.completion);
+    if (!retried.ok) return ok(fallback(used));
+    return ok({ ...guardedFields(input.note, retried.value, guarded), tokens: used, guarded });
   }
 
   return {
     async classify(input, ctx) {
       const previous = pending;
       let release: () => void = () => undefined;
-      pending = new Promise<void>((resolve) => { release = resolve; });
+      pending = new Promise<void>((resolve) => {
+        release = resolve;
+      });
       await previous;
       try {
         return await classifyOne(input, ctx);
