@@ -19,7 +19,7 @@ const CUES: Cue[] = [
   { pattern: /\b(rfid|sensor|telemetry|checksum|weight (reading|sensor)|kg over|reading is|cycle log|logged|fault)\b/, category: "sensor" },
   { pattern: /\b(soaking|pooled|saturated|dripping|free water)\b/, category: "moisture", severity: "medium" },
   { pattern: /\b(damp|wet|condensation|moisture)\b/, category: "moisture" },
-  { pattern: /\b(burnt|rotten|ammonia|chemical)\b/, category: "odor", severity: "high" },
+  { pattern: /\b(burning|burnt|rotten|ammonia|chemical)\b/, category: "odor", severity: "high" },
   { pattern: /\b(smell\w*|odou?r|mildew|musty|sour)\b/, category: "odor" },
   { pattern: /\b(stains?|streaks|discoloration|marks|dye)\b/, category: "stain" },
   { pattern: /\b(wrong node|does not match|swapped|name tag|missing)\b/, category: "other", severity: "medium" },
@@ -28,7 +28,7 @@ const CUES: Cue[] = [
 const DEFAULT_SEVERITY: Record<Category, Severity> = { contamination: "medium", damage: "medium", moisture: "low", odor: "low", other: "low", sensor: "low", stain: "low" };
 const RAISERS: Array<[RegExp, Severity]> = [
   [/\b(strong|lingered|make eyes water|sharp|every garment|all garments|large|half the contents|no longer|missing)\b/, "medium"],
-  [/\b(burnt|scorch\w*|rotten|hot plastic|biohazard|blood|syringe|fuel|cracked)\b/, "high"],
+  [/\b(burning|burnt|scorch\w*|rotten|hot plastic|biohazard|blood|syringe|fuel|cracked)\b/, "high"],
 ];
 const RANK: Record<Severity, number> = { low: 0, medium: 1, high: 2 };
 
@@ -47,7 +47,7 @@ function actionFor(category: Category, severity: Severity, text: string): Triage
   }
 }
 
-/** The starter's classifier: a keyword table over the note. */
+/** The deterministic fallback classifier used when an oracle answer cannot be validated. */
 export function classifyByKeywords(note: string): TriageFields {
   const text = note.trim().replace(/\s+/g, " ").toLowerCase();
   const hit = CUES.find((c) => c.pattern.test(text));
